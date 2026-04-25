@@ -11,7 +11,7 @@
 #include "znedi3_impl.h"
 
 #ifdef _WIN32
-  #include <Windows.h>
+  #include <filesystem>
 #endif
 
 static_assert(std::numeric_limits<float>::is_iec559, "IEEE-754 required");
@@ -22,23 +22,6 @@ namespace {
 struct FileCloser {
 	void operator()(std::FILE *file) const { std::fclose(file); }
 };
-
-#ifdef _WIN32
-std::wstring utf8_to_utf16(const std::string &s)
-{
-	if (s.size() > static_cast<size_t>(INT_MAX))
-		throw std::length_error{ "" };
-
-	std::wstring us(s.size(), L'\0');
-
-	int len = ::MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, s.data(), static_cast<int>(s.size()), &us[0], static_cast<int>(us.size()));
-	if (!len)
-		throw std::runtime_error{ "bad UTF-8/UTF-16 conversion" };
-
-	us.resize(len);
-	return us;
-}
-#endif
 
 } // namespace
 
@@ -56,8 +39,7 @@ znedi3_weights *znedi3_weights_read(const void *data, size_t size) try
 znedi3_weights *znedi3_weights_from_file(const char *path) try
 {
 #ifdef _WIN32
-	std::wstring path_utf16 = utf8_to_utf16(path);
-	std::unique_ptr<std::FILE, FileCloser> file_uptr{ _wfopen(path_utf16.c_str(), L"rb") };
+	std::unique_ptr<std::FILE, FileCloser> file_uptr{ _wfopen(std::filesystem::u8path(path).c_str(), L"rb") };
 #else
 	std::unique_ptr<std::FILE, FileCloser> file_uptr{ std::fopen(path, "rb") };
 #endif

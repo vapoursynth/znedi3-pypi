@@ -42,7 +42,7 @@ jobs:
 
     - uses: actions/upload-artifact@v7
       with:
-        name: mvtools-${{ matrix.arch }}
+        name: znedi3-${{ matrix.arch }}
         path: dist
 
   build-windows-wheel:

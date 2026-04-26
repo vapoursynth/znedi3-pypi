@@ -1,5 +1,5 @@
 project('ZNEDI3', 'cpp',
-    default_options: ['buildtype=release', 'warning_level=2', 'b_lto=true', 'b_ndebug=if-release', 'cpp_std=c++14'],
+    default_options: ['buildtype=release', 'warning_level=2', 'b_lto=true', 'b_ndebug=if-release', 'cpp_std=c++17'],
     license: 'GPL-2.0',
     license_files: 'gpl2.txt',
     meson_version: '>=1.2.3',

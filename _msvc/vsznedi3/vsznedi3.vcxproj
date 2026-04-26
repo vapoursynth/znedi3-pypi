@@ -80,6 +80,7 @@
       <AdditionalIncludeDirectories>$(ProjectDir)..\..\znedi3;$(ProjectDir)..\..\vsxx;$(ProjectDir)..\..\vsxx\VapourSynth;$(ProjectDir)..\..\vsznedi3</AdditionalIncludeDirectories>
       <PreprocessorDefinitions>_SCL_SECURE_NO_WARNINGS;_CRT_SECURE_NO_WARNINGS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
+      <LanguageStandard>stdcpp17</LanguageStandard>
     </ClCompile>
     <Link>
       <EnableCOMDATFolding>true</EnableCOMDATFolding>
@@ -96,6 +97,7 @@
       <AdditionalIncludeDirectories>$(ProjectDir)..\..\znedi3;$(ProjectDir)..\..\vsxx;$(ProjectDir)..\..\vsznedi3</AdditionalIncludeDirectories>
       <PreprocessorDefinitions>_SCL_SECURE_NO_WARNINGS;_CRT_SECURE_NO_WARNINGS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <RuntimeLibrary>MultiThreadedDebug</RuntimeLibrary>
+      <LanguageStandard>stdcpp17</LanguageStandard>
     </ClCompile>
     <Link>
       <AdditionalLibraryDirectories>$(OutDir)</AdditionalLibraryDirectories>
@@ -110,6 +112,7 @@
       <AdditionalIncludeDirectories>$(ProjectDir)..\..\znedi3;$(ProjectDir)..\..\vsxx;$(ProjectDir)..\..\vsznedi3</AdditionalIncludeDirectories>
       <PreprocessorDefinitions>_SCL_SECURE_NO_WARNINGS;_CRT_SECURE_NO_WARNINGS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <RuntimeLibrary>MultiThreadedDebug</RuntimeLibrary>
+      <LanguageStandard>stdcpp17</LanguageStandard>
     </ClCompile>
     <Link>
       <AdditionalLibraryDirectories>$(OutDir)</AdditionalLibraryDirectories>
@@ -126,6 +129,7 @@
       <AdditionalIncludeDirectories>$(ProjectDir)..\..\znedi3;$(ProjectDir)..\..\vsxx;$(ProjectDir)..\..\vsxx\VapourSynth;$(ProjectDir)..\..\vsznedi3</AdditionalIncludeDirectories>
       <PreprocessorDefinitions>_SCL_SECURE_NO_WARNINGS;_CRT_SECURE_NO_WARNINGS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
+      <LanguageStandard>stdcpp17</LanguageStandard>
     </ClCompile>
     <Link>
       <EnableCOMDATFolding>true</EnableCOMDATFolding>

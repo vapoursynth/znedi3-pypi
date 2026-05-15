@@ -5,7 +5,6 @@
 
 #include <cstddef>
 #include <memory>
-#include "kernel.h"
 #include "znedi3.h"
 
 struct znedi3_filter {

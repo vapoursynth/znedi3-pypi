@@ -5,14 +5,12 @@
 #include <cstdint>
 #include <cstring>
 #include <stdexcept>
-#include <tuple>
 #include <utility>
 #include "graphengine/filter.h"
 #include "graphengine/graph.h"
 #include "graphengine/types.h"
-#include "align.h"
-#include "alloc.h"
 #include "cpuinfo.h"
+#include "kernel.h"
 #include "weights.h"
 #include "znedi3_impl.h"
 

@@ -1,11 +1,7 @@
 #include <algorithm>
-#include <cassert>
 #include <cstdio>
 #include <limits>
 #include <memory>
-#include <stdexcept>
-#include <string>
-#include <vector>
 #include "weights.h"
 #include "znedi3.h"
 #include "znedi3_impl.h"

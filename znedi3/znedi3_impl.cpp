@@ -176,7 +176,7 @@ public:
 			std::fill_n(dstp, PADDING_H, val);
 		}
 		if (right >= m_orig_width + PADDING_H) {
-			float val = dstp[PADDING_H];
+			float val = dstp[m_orig_width + PADDING_H - 1];
 			std::fill_n(dstp + m_orig_width + PADDING_H, PADDING_H, val);
 		}
 	}

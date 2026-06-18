@@ -1,10 +1,9 @@
 #include <algorithm>
 #include <cstdint>
+#include <filesystem>
 #include <memory>
-#include <mutex>
 #include <stdexcept>
 #include <utility>
-#include <vector>
 #include <znedi3.h>
 
 #include <VSConstants4.h>

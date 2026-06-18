@@ -5,14 +5,12 @@
 #include <cstdint>
 #include <cstring>
 #include <stdexcept>
-#include <tuple>
 #include <utility>
 #include "graphengine/filter.h"
 #include "graphengine/graph.h"
 #include "graphengine/types.h"
-#include "align.h"
-#include "alloc.h"
 #include "cpuinfo.h"
+#include "kernel.h"
 #include "weights.h"
 #include "znedi3_impl.h"
 
@@ -178,7 +176,7 @@ public:
 			std::fill_n(dstp, PADDING_H, val);
 		}
 		if (right >= m_orig_width + PADDING_H) {
-			float val = dstp[PADDING_H];
+			float val = dstp[m_orig_width + PADDING_H - 1];
 			std::fill_n(dstp + m_orig_width + PADDING_H, PADDING_H, val);
 		}
 	}
@@ -302,7 +300,7 @@ public:
 		m_desc.num_planes = 1;
 		m_desc.step = 1;
 
-		m_desc.context_size = prescreener ? 0 : width;
+		m_desc.context_size = prescreener ? 0 : padded_width(width);
 		m_desc.scratchpad_size = m_predictor->get_tmp_size();
 	}
 
@@ -330,7 +328,7 @@ public:
 	void init_context(void *context) const noexcept override
 	{
 		if (!m_prescreen)
-			std::memset(static_cast<uint8_t *>(context) + PADDING_H, 1, m_desc.format.width - PADDING_H * 2 );
+			std::memset(static_cast<uint8_t *>(context) + PADDING_H, 0, m_desc.format.width - PADDING_H * 2 );
 	}
 
 	void process(const graphengine::BufferDescriptor in[], const graphengine::BufferDescriptor *out, unsigned i, unsigned left, unsigned right, void *context, void *tmp) const noexcept override
@@ -342,12 +340,12 @@ public:
 		right = std::min(std::max(right, left), m_desc.format.width - PADDING_H);
 
 		const float *srcp[6] = {
-			in->get_line<float>(i - 3) + left,
-			in->get_line<float>(i - 2) + left,
-			in->get_line<float>(i - 1) + left,
-			in->get_line<float>(i + 0) + left,
-			in->get_line<float>(i + 1) + left,
-			in->get_line<float>(i + 2) + left,
+			in[0].get_line<float>(i - 3) + left,
+			in[0].get_line<float>(i - 2) + left,
+			in[0].get_line<float>(i - 1) + left,
+			in[0].get_line<float>(i + 0) + left,
+			in[0].get_line<float>(i + 1) + left,
+			in[0].get_line<float>(i + 2) + left,
 		};
 
 		const uint8_t *pscrn = (m_prescreen ? in[1].get_line<uint8_t>(i) : static_cast<uint8_t *>(context)) + left;

@@ -3,7 +3,7 @@ project('ZNEDI3', 'cpp',
     license: 'GPL-2.0',
     license_files: 'gpl2.txt',
     meson_version: '>=1.2.3',
-    version: '3.2',
+    version: '3.3',
 )
 
 graphengine_sources = [

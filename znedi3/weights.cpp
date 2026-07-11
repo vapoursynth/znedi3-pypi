@@ -284,7 +284,11 @@ bool read_nnedi3_weights_hvsym(NNEDI3Weights &into, const void *data, size_t siz
 				    !rd(c.softmax_gen_q2, gsize) || !rd(c.elliott_gen_q2, gsize) || !rd(c.softmax_bias_q2, ng) || !rd(c.elliott_bias_q2, ng))
 					return false;
 
-				model_set.emplace(PredictorTraits{ xdim, ydim, nns }, std::move(c));
+				// All-zero generators are the "excluded" sentinel (a config where the h+v fold loses
+				// too much quality). Don't register it -> the filter falls back to the dense predictor.
+				bool present = std::any_of(c.softmax_gen_q1, c.softmax_gen_q1 + gsize, [](float x) { return x != 0.0f; });
+				if (present)
+					model_set.emplace(PredictorTraits{ xdim, ydim, nns }, std::move(c));
 			}
 		}
 	}

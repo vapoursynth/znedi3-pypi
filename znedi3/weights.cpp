@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cstddef>
+#include <cstring>
 #include <numeric>
 #include <vector>
 #include "weights.h"
@@ -223,6 +224,71 @@ std::unique_ptr<NNEDI3Weights> read_nnedi3_weights(const float *data)
 	assert(size == 0);
 
 	return nnedi3;
+}
+
+namespace {
+
+SymmetricPredictorCoefficients allocate_symmetric(unsigned xdim, unsigned ydim, unsigned nns)
+{
+	unsigned ng = nns / 4;
+	unsigned gsize = ng * (xdim - 1) * ydim;
+
+	SymmetricPredictorCoefficients c;
+	c.data.reset(new float[(2 * static_cast<size_t>(gsize) + 2 * ng) * 2]);
+
+	float *ptr = c.data.get();
+	auto allocate = [&](size_t n) { float *r = ptr; ptr += n; return r; };
+
+	c.softmax_gen_q1 = allocate(gsize);
+	c.elliott_gen_q1 = allocate(gsize);
+	c.softmax_bias_q1 = allocate(ng);
+	c.elliott_bias_q1 = allocate(ng);
+	c.softmax_gen_q2 = allocate(gsize);
+	c.elliott_gen_q2 = allocate(gsize);
+	c.softmax_bias_q2 = allocate(ng);
+	c.elliott_bias_q2 = allocate(ng);
+	return c;
+}
+
+} // namespace
+
+bool read_nnedi3_weights_hvsym(NNEDI3Weights &into, const void *data, size_t size)
+{
+	if (size < 8 || std::memcmp(data, "HVSYMB1\0", 8) != 0)
+		return false;
+
+	const float *p = reinterpret_cast<const float *>(static_cast<const char *>(data) + 8);
+	const float *end = reinterpret_cast<const float *>(static_cast<const char *>(data) + size);
+	auto rd = [&](float *dst, size_t n) -> bool {
+		if (p + n > end)
+			return false;
+		std::copy_n(p, n, dst);
+		p += n;
+		return true;
+	};
+
+	// Same nested order as read_nnedi3_weights: etype -> nns -> size -> q1/q2 (softmax, elliott, biases),
+	// but generators (nns/4) at width (xdim-1). No prescreener.
+	for (unsigned m = 0; m < 2; ++m) {
+		SymmetricPredictorModelSet &model_set = m ? into.sym_mse_models() : into.sym_abs_models();
+
+		for (unsigned i = 0; i < 5; ++i) {
+			unsigned nns = NNEDI3_NNS[i];
+
+			for (unsigned j = 0; j < 7; ++j) {
+				unsigned xdim = NNEDI3_XDIM[j], ydim = NNEDI3_YDIM[j];
+				unsigned ng = nns / 4, gsize = ng * (xdim - 1) * ydim;
+
+				SymmetricPredictorCoefficients c = allocate_symmetric(xdim, ydim, nns);
+				if (!rd(c.softmax_gen_q1, gsize) || !rd(c.elliott_gen_q1, gsize) || !rd(c.softmax_bias_q1, ng) || !rd(c.elliott_bias_q1, ng) ||
+				    !rd(c.softmax_gen_q2, gsize) || !rd(c.elliott_gen_q2, gsize) || !rd(c.softmax_bias_q2, ng) || !rd(c.elliott_bias_q2, ng))
+					return false;
+
+				model_set.emplace(PredictorTraits{ xdim, ydim, nns }, std::move(c));
+			}
+		}
+	}
+	return p == end;
 }
 
 } // namespace znedi3

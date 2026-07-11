@@ -75,6 +75,43 @@ void znedi3_weights_free(znedi3_weights *ptr)
 	delete static_cast<znedi3::NNEDI3Weights *>(ptr);
 }
 
+int znedi3_weights_add_hvsym(znedi3_weights *weights, const void *data, size_t size) try
+{
+	if (!weights)
+		return 0;
+	return znedi3::read_nnedi3_weights_hvsym(*static_cast<znedi3::NNEDI3Weights *>(weights), data, size) ? 1 : 0;
+} catch (...) {
+	return 0;
+}
+
+int znedi3_weights_add_hvsym_from_file(znedi3_weights *weights, const char *path) try
+{
+	if (!weights)
+		return 0;
+
+#ifdef _WIN32
+	std::unique_ptr<std::FILE, FileCloser> file_uptr{ _wfopen(std::filesystem::u8path(path).c_str(), L"rb") };
+#else
+	std::unique_ptr<std::FILE, FileCloser> file_uptr{ std::fopen(path, "rb") };
+#endif
+	std::FILE *file = file_uptr.get();
+	if (!file || std::fseek(file, 0, SEEK_END))
+		return 0;
+
+	long size = std::ftell(file);
+	if (size <= 8)
+		return 0;
+	std::rewind(file);
+
+	std::unique_ptr<char[]> buf{ new char[size] };
+	if (std::fread(buf.get(), 1, size, file) != static_cast<size_t>(size))
+		return 0;
+
+	return znedi3_weights_add_hvsym(weights, buf.get(), static_cast<size_t>(size));
+} catch (...) {
+	return 0;
+}
+
 void znedi3_filter_params_default(znedi3_filter_params *params)
 {
 	params->pixel_type = static_cast<znedi3_pixel_type_e>(-1);
@@ -89,6 +126,7 @@ void znedi3_filter_params_default(znedi3_filter_params *params)
 	params->int16_prescreen = 0;
 	params->slow_exp = 0;
 	params->show_mask = 0;
+	params->symmetric = 0;
 }
 
 znedi3_filter *znedi3_filter_create(const znedi3_weights *weights, const znedi3_filter_params *params, unsigned width, unsigned height) try

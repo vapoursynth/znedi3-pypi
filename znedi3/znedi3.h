@@ -84,6 +84,14 @@ znedi3_weights *znedi3_weights_from_file(const char *path);
 
 void znedi3_weights_free(znedi3_weights *ptr);
 
+/* Load h+v-symmetric generator weights (nnedi3_weights_hvsym.bin: magic "HVSYMB1\0" + float
+ * generators) into an existing weights object, which keeps its prescreener and normal predictors.
+ * Enables the symmetric predictor path (select it via znedi3_filter_params::symmetric). Returns
+ * non-zero on success, 0 on bad magic / truncated data. */
+int znedi3_weights_add_hvsym(znedi3_weights *weights, const void *data, size_t size);
+
+int znedi3_weights_add_hvsym_from_file(znedi3_weights *weights, const char *path);
+
 
 typedef struct znedi3_filter_params {
 	znedi3_pixel_type_e pixel_type;
@@ -98,6 +106,7 @@ typedef struct znedi3_filter_params {
 	unsigned char int16_predict;
 	unsigned char slow_exp;
 	unsigned char show_mask;
+	unsigned char symmetric;   /**< Use the h+v-symmetric predictor (requires znedi3_weights_add_hvsym). */
 } znedi3_filter_params;
 
 typedef struct znedi3_filter znedi3_filter;

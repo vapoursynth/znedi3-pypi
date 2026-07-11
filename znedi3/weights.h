@@ -61,6 +61,21 @@ struct PredictorCoefficients {
 	float *elliott_bias_q2;
 };
 
+// h+v-symmetric predictor: only the nns/4 flip-orbit generators, at the target-centred odd
+// width N-1 (filter_size = (xdim-1)*ydim). The full nns experts are the Klein-4 flips of each
+// generator; biases are shared within an orbit. Loaded from nnedi3_weights_hvsym.bin.
+struct SymmetricPredictorCoefficients {
+	std::unique_ptr<float[]> data;
+	float *softmax_gen_q1;    // [nns/4 * (xdim-1)*ydim]
+	float *elliott_gen_q1;
+	float *softmax_bias_q1;   // [nns/4]
+	float *elliott_bias_q1;
+	float *softmax_gen_q2;
+	float *elliott_gen_q2;
+	float *softmax_bias_q2;
+	float *elliott_bias_q2;
+};
+
 
 // Helper functions for std::unordered_map.
 struct PredictorTraitsHash {
@@ -73,6 +88,11 @@ constexpr bool operator!=(const PredictorTraits &lhs, const PredictorTraits &rhs
 
 typedef std::pair<const PredictorTraits, PredictorCoefficients> PredictorModel;
 typedef std::unordered_map<PredictorTraits, PredictorCoefficients, PredictorTraitsHash> PredictorModelSet;
+
+// Symmetric models are keyed by the SAME (full) traits as the normal models, so the filter can
+// look one up with the user's nsize/nns and fall back to the normal model if absent.
+typedef std::pair<const PredictorTraits, SymmetricPredictorCoefficients> SymmetricPredictorModel;
+typedef std::unordered_map<PredictorTraits, SymmetricPredictorCoefficients, PredictorTraitsHash> SymmetricPredictorModelSet;
 
 PredictorModel allocate_model(const PredictorTraits &traits);
 PredictorModel copy_model(const PredictorModel &model);
@@ -99,9 +119,26 @@ public:
 
 	PredictorModelSet &mse_models() { return m_predictors_mse; }
 	const PredictorModelSet &mse_models() const { return m_predictors_mse; }
+
+	SymmetricPredictorModelSet &sym_abs_models() { return m_predictors_sym_abs; }
+	const SymmetricPredictorModelSet &sym_abs_models() const { return m_predictors_sym_abs; }
+
+	SymmetricPredictorModelSet &sym_mse_models() { return m_predictors_sym_mse; }
+	const SymmetricPredictorModelSet &sym_mse_models() const { return m_predictors_sym_mse; }
+
+	bool has_symmetric() const { return !m_predictors_sym_abs.empty(); }
+
+private:
+	SymmetricPredictorModelSet m_predictors_sym_abs;
+	SymmetricPredictorModelSet m_predictors_sym_mse;
 };
 
 std::unique_ptr<NNEDI3Weights> read_nnedi3_weights(const float *data);
+
+// Load the h+v-symmetric generator weights from an in-memory nnedi3_weights_hvsym.bin (magic
+// "HVSYMB1\0" + float generators) into an existing NNEDI3Weights (which keeps its prescreener and
+// normal predictors from the original file). Returns false on bad magic / short data.
+bool read_nnedi3_weights_hvsym(NNEDI3Weights &into, const void *data, size_t size);
 
 
 inline size_t PredictorTraitsHash::operator()(const PredictorTraits &traits) const noexcept

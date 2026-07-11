@@ -998,6 +998,165 @@ inline FORCE_INLINE void wae5_x4(const float *softmax, const float *elliott, uns
 }
 
 
+// ---- h+v-symmetric folded predictor (mask-register-free) ----
+
+// Folded mat-vec + Klein-4 combine for 4 pixels. wf[c]: interleaved [Rp][2*ng]; xh[c]: [4 pixels][Rp].
+// Produces act_softmax/act_elliott laid out [4 pixels][nns] (nns = 4*ng), scaled + biased.
+inline FORCE_INLINE void sym_folded_matvec(const float * const wf[4], const float * const xh[4], int Rp, int ng,
+                                           const float *sbias, const float *ebias, const float scale[4],
+                                           float *as, float *ae)
+{
+	int twong = 2 * ng, nns = 4 * ng;
+	const __m512 q = _mm512_set1_ps(0.25f);
+	const float *X0 = xh[0], *X1 = xh[1], *X2 = xh[2], *X3 = xh[3];
+
+	for (int b = 0; b < twong; b += 16) {
+		__m512 a00=_mm512_setzero_ps(),a01=_mm512_setzero_ps(),a02=_mm512_setzero_ps(),a03=_mm512_setzero_ps();
+		__m512 a10=_mm512_setzero_ps(),a11=_mm512_setzero_ps(),a12=_mm512_setzero_ps(),a13=_mm512_setzero_ps();
+		__m512 a20=_mm512_setzero_ps(),a21=_mm512_setzero_ps(),a22=_mm512_setzero_ps(),a23=_mm512_setzero_ps();
+		__m512 a30=_mm512_setzero_ps(),a31=_mm512_setzero_ps(),a32=_mm512_setzero_ps(),a33=_mm512_setzero_ps();
+		const float *W0 = wf[0]+b, *W1 = wf[1]+b, *W2 = wf[2]+b, *W3 = wf[3]+b;
+		for (int o = 0; o < Rp; ++o) {
+			__m512 w;
+			w = _mm512_loadu_ps(W0 + (size_t)o*twong);
+			a00=_mm512_fmadd_ps(w,_mm512_set1_ps(X0[0*Rp+o]),a00); a01=_mm512_fmadd_ps(w,_mm512_set1_ps(X0[1*Rp+o]),a01);
+			a02=_mm512_fmadd_ps(w,_mm512_set1_ps(X0[2*Rp+o]),a02); a03=_mm512_fmadd_ps(w,_mm512_set1_ps(X0[3*Rp+o]),a03);
+			w = _mm512_loadu_ps(W1 + (size_t)o*twong);
+			a10=_mm512_fmadd_ps(w,_mm512_set1_ps(X1[0*Rp+o]),a10); a11=_mm512_fmadd_ps(w,_mm512_set1_ps(X1[1*Rp+o]),a11);
+			a12=_mm512_fmadd_ps(w,_mm512_set1_ps(X1[2*Rp+o]),a12); a13=_mm512_fmadd_ps(w,_mm512_set1_ps(X1[3*Rp+o]),a13);
+			w = _mm512_loadu_ps(W2 + (size_t)o*twong);
+			a20=_mm512_fmadd_ps(w,_mm512_set1_ps(X2[0*Rp+o]),a20); a21=_mm512_fmadd_ps(w,_mm512_set1_ps(X2[1*Rp+o]),a21);
+			a22=_mm512_fmadd_ps(w,_mm512_set1_ps(X2[2*Rp+o]),a22); a23=_mm512_fmadd_ps(w,_mm512_set1_ps(X2[3*Rp+o]),a23);
+			w = _mm512_loadu_ps(W3 + (size_t)o*twong);
+			a30=_mm512_fmadd_ps(w,_mm512_set1_ps(X3[0*Rp+o]),a30); a31=_mm512_fmadd_ps(w,_mm512_set1_ps(X3[1*Rp+o]),a31);
+			a32=_mm512_fmadd_ps(w,_mm512_set1_ps(X3[2*Rp+o]),a32); a33=_mm512_fmadd_ps(w,_mm512_set1_ps(X3[3*Rp+o]),a33);
+		}
+		int gg = b < ng ? b : b - ng;
+		const float *bias = b < ng ? sbias : ebias;
+		float *act = b < ng ? as : ae;
+		__m512 bs = _mm512_loadu_ps(bias + gg);
+		#define ZSYM_CMB(p,P0,P1,P2,P3) { \
+			__m512 s01=_mm512_add_ps(P0,P1), d01=_mm512_sub_ps(P0,P1), s23=_mm512_add_ps(P2,P3), d23=_mm512_sub_ps(P2,P3); \
+			__m512 sc=_mm512_set1_ps(scale[p]); \
+			_mm512_storeu_ps(act+(size_t)(p)*nns+0*ng+gg, _mm512_fmadd_ps(sc,_mm512_mul_ps(q,_mm512_add_ps(s01,s23)),bs)); \
+			_mm512_storeu_ps(act+(size_t)(p)*nns+1*ng+gg, _mm512_fmadd_ps(sc,_mm512_mul_ps(q,_mm512_add_ps(d01,d23)),bs)); \
+			_mm512_storeu_ps(act+(size_t)(p)*nns+2*ng+gg, _mm512_fmadd_ps(sc,_mm512_mul_ps(q,_mm512_sub_ps(s01,s23)),bs)); \
+			_mm512_storeu_ps(act+(size_t)(p)*nns+3*ng+gg, _mm512_fmadd_ps(sc,_mm512_mul_ps(q,_mm512_sub_ps(d01,d23)),bs)); }
+		ZSYM_CMB(0,a00,a10,a20,a30) ZSYM_CMB(1,a01,a11,a21,a31)
+		ZSYM_CMB(2,a02,a12,a22,a32) ZSYM_CMB(3,a03,a13,a23,a33)
+		#undef ZSYM_CMB
+	}
+}
+
+class PredictorSymmetricAVX512F final : public Predictor {
+	SymmetricInterleavedModel m_model;
+	double m_inv_filter_size;
+	bool m_use_q2;
+
+	void fold_window(const float *buf, float *xh0, float *xh1, float *xh2, float *xh3) const
+	{
+		const int32_t *g = m_model.gather.data();
+		int Rp = static_cast<int>(m_model.Rp);
+		for (int o = 0; o < Rp; o += 16) {
+			__m512 A = _mm512_i32gather_ps(_mm512_loadu_si512(g + 0*Rp + o), buf, 4);
+			__m512 B = _mm512_i32gather_ps(_mm512_loadu_si512(g + 1*Rp + o), buf, 4);
+			__m512 C = _mm512_i32gather_ps(_mm512_loadu_si512(g + 2*Rp + o), buf, 4);
+			__m512 D = _mm512_i32gather_ps(_mm512_loadu_si512(g + 3*Rp + o), buf, 4);
+			__m512 s01=_mm512_add_ps(A,B), d01=_mm512_sub_ps(A,B), s23=_mm512_add_ps(C,D), d23=_mm512_sub_ps(C,D);
+			_mm512_storeu_ps(xh0 + o, _mm512_add_ps(s01,s23));
+			_mm512_storeu_ps(xh1 + o, _mm512_add_ps(d01,d23));
+			_mm512_storeu_ps(xh2 + o, _mm512_sub_ps(s01,s23));
+			_mm512_storeu_ps(xh3 + o, _mm512_sub_ps(d01,d23));
+		}
+	}
+
+	void apply4(const float *buf, float *xh, float *const xhc[4], float *act, float *mstd, const double *sum, const double *sumsq) const
+	{
+		unsigned nm1 = m_model.xdim - 1, ydim = m_model.ydim, nns = m_model.nns, ng = m_model.ng;
+		int Rp = static_cast<int>(m_model.Rp);
+		float scale[4];
+		for (int p = 0; p < 4; ++p) {
+			double mean = sum[p] * m_inv_filter_size;
+			double var = sumsq[p] * m_inv_filter_size - mean * mean;
+			float sd = var < FLT_EPSILON ? 0.0f : static_cast<float>(std::sqrt(var));
+			float inv = sd == 0.0f ? 0.0f : 1.0f / sd;
+			mstd[0 + p] = static_cast<float>(mean); mstd[4 + p] = sd; mstd[8 + p] = inv; mstd[12 + p] = 0.0f;
+			scale[p] = inv;
+		}
+		for (int p = 0; p < 4; ++p)
+			fold_window(buf + (size_t)p*nm1*ydim, xhc[0] + p*Rp, xhc[1] + p*Rp, xhc[2] + p*Rp, xhc[3] + p*Rp);
+
+		float *as = act, *ae = act + 4 * static_cast<size_t>(nns);
+		const float *xhp[4] = { xhc[0], xhc[1], xhc[2], xhc[3] };
+		for (unsigned qq = 0; qq < (m_use_q2 ? 2u : 1u); ++qq) {
+			const float *wf = qq ? m_model.wfold_q2 : m_model.wfold_q1;
+			const float *bias = qq ? m_model.bias_q2 : m_model.bias_q1;
+			size_t cs = static_cast<size_t>(Rp) * 2 * ng;
+			const float *wfc[4] = { wf, wf + cs, wf + 2*cs, wf + 3*cs };
+			sym_folded_matvec(wfc, xhp, Rp, static_cast<int>(ng), bias, bias + ng, scale, as, ae);
+			softmax_exp(as, 4 * nns);
+			wae5_x4(as, ae, nns, mstd);
+		}
+	}
+public:
+	PredictorSymmetricAVX512F(const SymmetricPredictorModel &model, bool use_q2) :
+		m_model(create_symmetric_interleaved_model(model)),
+		m_inv_filter_size{ 1.0 / (static_cast<double>(m_model.xdim - 1) * m_model.ydim) },
+		m_use_q2{ use_q2 }
+	{}
+
+	size_t get_tmp_size() const noexcept override
+	{
+		FakeAllocator alloc;
+		alloc.allocate_n<float>(4 * (m_model.xdim - 1) * m_model.ydim);   // window buffers
+		alloc.allocate_n<float>(4 * 4 * m_model.Rp);                      // folded windows
+		alloc.allocate_n<float>(2 * 4 * m_model.nns);                     // activations
+		return alloc.count();
+	}
+
+	void process(const float * const src[6], float *dst, const unsigned char *prescreen, void *tmp, unsigned n) const noexcept override
+	{
+		unsigned nm1 = m_model.xdim - 1, ydim = m_model.ydim, nns = m_model.nns;
+		unsigned wy = 3 - ydim / 2;
+		ptrdiff_t off_x = static_cast<ptrdiff_t>(m_model.window_offset_x);
+
+		LinearAllocator alloc{ tmp };
+		float *buf = alloc.allocate_n<float>(4 * nm1 * ydim);
+		float *xh = alloc.allocate_n<float>(4 * 4 * m_model.Rp);
+		float *act = alloc.allocate_n<float>(2 * 4 * nns);
+		float *xhc[4] = { xh, xh + 4*m_model.Rp, xh + 8*m_model.Rp, xh + 12*m_model.Rp };
+		alignas(64) float mstd[16];
+		double sum[4] = { 0, 0, 0, 0 }, sumsq[4] = { 0, 0, 0, 0 };
+		unsigned gathered_idx[4], num = 0;
+
+		auto gather = [&](ptrdiff_t i) {
+			float *b = buf + (size_t)num * nm1 * ydim;
+			double s = 0, sq = 0;
+			for (unsigned r = 0; r < ydim; ++r) {
+				const float *row = src[wy + r] + (i - off_x);
+				for (unsigned c = 0; c < nm1; ++c) { float v = row[c]; b[r*nm1 + c] = v; s += v; sq += static_cast<double>(v) * v; }
+			}
+			sum[num] = s; sumsq[num] = sq; gathered_idx[num] = static_cast<unsigned>(i); ++num;
+		};
+
+		for (ptrdiff_t i = 0; i < static_cast<ptrdiff_t>(n); ++i) {
+			if (prescreen[i])
+				continue;
+			gather(i);
+			if (num == 4) {
+				apply4(buf, xh, xhc, act, mstd, sum, sumsq);
+				for (int p = 0; p < 4; ++p) dst[gathered_idx[p]] = mstd[12 + p] * (m_use_q2 ? 0.5f : 1.0f);
+				num = 0;
+			}
+		}
+		if (num) {
+			apply4(buf, xh, xhc, act, mstd, sum, sumsq);
+			for (unsigned p = 0; p < num; ++p) dst[gathered_idx[p]] = mstd[12 + p] * (m_use_q2 ? 0.5f : 1.0f);
+		}
+	}
+};
+
+
 template <unsigned N>
 class PredictorAVX512F final : public Predictor {
 	InterleavedPredictorModel m_model;
@@ -1242,6 +1401,11 @@ std::unique_ptr<Predictor> create_predictor_avx512f(const PredictorModel &model,
 		return std::make_unique<PredictorAVX512F<64>>(model, use_q2);
 	else
 		return std::make_unique<PredictorAVX512F<32>>(model, use_q2);
+}
+
+std::unique_ptr<Predictor> create_symmetric_predictor_avx512f(const SymmetricPredictorModel &model, bool use_q2)
+{
+	return std::make_unique<PredictorSymmetricAVX512F>(model, use_q2);
 }
 
 } // namespace znedi3

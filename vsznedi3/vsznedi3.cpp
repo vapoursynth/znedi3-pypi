@@ -116,6 +116,16 @@ public:
 		if (!nnedi3_weights)
 			throw std::runtime_error{ "error reading weights" };
 
+		// Optional h+v-symmetric generator weights (prescreener + normal predictors stay from the
+		// original file above). Selecting this file enables the folded symmetric predictor path.
+		bool use_symmetric = false;
+		if (in.contains("hvsym")) {
+			std::string hvsym_path = in.get_prop<std::string>("hvsym");
+			if (!znedi3_weights_add_hvsym_from_file(nnedi3_weights.get(), hvsym_path.c_str()))
+				throw std::runtime_error{ "error reading hvsym weights" };
+			use_symmetric = true;
+		}
+
 		m_clip = in.get_prop<FilterNode>("clip");
 		m_vi = m_clip.video_info();
 
@@ -190,6 +200,8 @@ public:
 
 		propagate_if_set(nnedi3_params.slow_exp, in.get_prop<int>("exp", map::default_val(-1)));
 		propagate_if_set(nnedi3_params.show_mask, in.get_prop<int>("show_mask", map::default_val(-1)));
+
+		nnedi3_params.symmetric = use_symmetric ? 1 : 0;
 
 		m_nnedi3.reset(znedi3_filter_create(nnedi3_weights.get(), &nnedi3_params, m_vi.width, m_vi.height / 2));
 		if (!m_nnedi3)
@@ -281,7 +293,8 @@ const PluginInfo4 g_plugin_info4{
 			"exp:int:opt;"
 			"show_mask:int:opt;"
 			"x_nnedi3_weights_bin:data:opt;"
-			"x_cpu:data:opt;",
+			"hvsym:data:opt;"
+				"x_cpu:data:opt;",
 			"clip:vnode;"
 		}
 	}

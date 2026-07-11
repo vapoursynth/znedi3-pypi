@@ -58,6 +58,32 @@ struct InterleavedPredictorModel {
 InterleavedPredictorModel create_interleaved_predictor_model(const PredictorModel &model);
 
 
+// h+v-symmetric folded predictor model. The nns/4 flip-orbit generators (at width xdim-1) are
+// mean-folded and Klein-4-transformed into 4 symmetry channels, each interleaved [Rp][2*ng] like
+// the dense model. The window is gathered at width xdim-1 and folded with the same Klein-4
+// transform (gather indices below); the folded mat-vec produces 4 channels per generator which a
+// cheap butterfly recombines into the nns experts. R = (xdim/2)*(ydim/2) orbits, padded to Rp
+// (multiple of 16). Mask-register-free by construction (everything padded to 16).
+struct SymmetricInterleavedModel {
+	AlignedVector<float> data;        // wfold_q1 | wfold_q2 | bias_q1 | bias_q2
+	AlignedVector<int32_t> gather;    // [4 * Rp] window-fold gather indices into the [ydim*(xdim-1)] window buffer
+
+	float *wfold_q1;   // [4 * Rp * 2*ng]; channel c at wfold_q1 + c*Rp*2*ng, laid out [Rp][2*ng]
+	float *wfold_q2;
+	float *bias_q1;    // [2*ng]: softmax generator biases (0..ng-1) then elliott generator biases (ng..2ng-1)
+	float *bias_q2;
+
+	unsigned xdim, ydim, nns;   // full xdim; effective window width is xdim-1
+	unsigned ng, R, Rp;         // generators (nns/4), orbits, padded orbits
+	unsigned window_offset_x;   // xdim/2 - 1
+};
+
+SymmetricInterleavedModel create_symmetric_interleaved_model(const SymmetricPredictorModel &model);
+
+std::unique_ptr<Predictor> create_symmetric_predictor_avx512f(const SymmetricPredictorModel &model, bool use_q2);
+std::unique_ptr<Predictor> create_symmetric_predictor_x86(const SymmetricPredictorModel &model, bool use_q2, CPUClass cpu);
+
+
 // SSE
 std::unique_ptr<Prescreener> create_prescreener_old_sse(const PrescreenerOldCoefficients &coeffs, double pixel_half);
 std::unique_ptr<Prescreener> create_prescreener_new_sse(const PrescreenerNewCoefficients &coeffs, double pixel_half);

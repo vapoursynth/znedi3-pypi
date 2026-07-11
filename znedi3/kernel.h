@@ -41,6 +41,7 @@ interpolate_func select_interpolate_func(CPUClass cpu);
 std::unique_ptr<Prescreener> create_prescreener_old(const PrescreenerOldCoefficients &coeffs, double pixel_half, CPUClass cpu);
 std::unique_ptr<Prescreener> create_prescreener_new(const PrescreenerNewCoefficients &coeffs, double pixel_half, CPUClass cpu);
 std::unique_ptr<Predictor> create_predictor(const std::pair<const PredictorTraits, PredictorCoefficients> &model, bool use_q2, CPUClass cpu);
+std::unique_ptr<Predictor> create_symmetric_predictor(const SymmetricPredictorModel &model, bool use_q2, CPUClass cpu);
 
 } // namespace znedi3
 

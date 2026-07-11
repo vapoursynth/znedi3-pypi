@@ -495,7 +495,16 @@ std::unique_ptr<znedi3_filter::filters> znedi3_filter::setup_filters(const NNEDI
 	PredictorTraits traits{ NNEDI3_XDIM[params.nsize], NNEDI3_YDIM[params.nsize], NNEDI3_NNS[params.nns] };
 	const PredictorModelSet &model_set = (params.etype == ZNEDI3_ETYPE_MSE) ? weights.mse_models() : weights.abs_models();
 	assert(model_set.find(traits) != model_set.end());
-	std::unique_ptr<Predictor> predictor = create_predictor(*model_set.find(traits), params.qual >= ZNEDI3_QUAL_2, cpu);
+
+	std::unique_ptr<Predictor> predictor;
+	if (params.symmetric && weights.has_symmetric()) {
+		const SymmetricPredictorModelSet &sym_set = (params.etype == ZNEDI3_ETYPE_MSE) ? weights.sym_mse_models() : weights.sym_abs_models();
+		auto it = sym_set.find(traits);
+		if (it != sym_set.end())
+			predictor = create_symmetric_predictor(*it, params.qual >= ZNEDI3_QUAL_2, cpu);
+	}
+	if (!predictor)
+		predictor = create_predictor(*model_set.find(traits), params.qual >= ZNEDI3_QUAL_2, cpu);
 
 	interpolate_func interpolate = nullptr;
 	if (params.show_mask >= 2)

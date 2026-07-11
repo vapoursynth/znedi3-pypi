@@ -179,6 +179,7 @@ public:
 class PredictorC final : public Predictor {
 	PredictorModel m_model;
 	bool m_use_q2;
+	ptrdiff_t m_offset_x;
 
 	size_t filter_offset(unsigned nn) const { return static_cast<size_t>(nn) * m_model.first.xdim * m_model.first.ydim; }
 
@@ -231,9 +232,10 @@ class PredictorC final : public Predictor {
 			mstd[3] += mstd[0];
 	}
 public:
-	PredictorC(const PredictorModel &model, bool use_q2) :
+	PredictorC(const PredictorModel &model, bool use_q2, ptrdiff_t offset_x = -1) :
 		m_model{ copy_model(model) },
-		m_use_q2{ use_q2 }
+		m_use_q2{ use_q2 },
+		m_offset_x{ offset_x >= 0 ? offset_x : static_cast<ptrdiff_t>(model.first.xdim) / 2 - 1 }
 	{
 		assert(model.first.xdim * model.first.ydim <= 48 * 6);
 		subtract_mean(m_model);
@@ -244,7 +246,7 @@ public:
 	void process(const float * const *src, float *dst, const unsigned char *prescreen, void *, unsigned n) const noexcept override
 	{
 		ptrdiff_t window_offset_y = 3 - static_cast<ptrdiff_t>(m_model.first.ydim / 2);
-		ptrdiff_t window_offset_x = m_model.first.xdim / 2 - 1;
+		ptrdiff_t window_offset_x = m_offset_x;
 
 		unsigned filter_size = m_model.first.xdim * m_model.first.ydim;
 		unsigned nns = m_model.first.nns;
@@ -286,6 +288,37 @@ public:
 		}
 	}
 };
+
+// Materialise the nns full experts (raw, width xdim-1) from the flip-orbit generators. Used by the
+// portable fallback, which then runs the dense PredictorC (it applies subtract_mean itself).
+PredictorModel materialise_symmetric(const SymmetricPredictorModel &model)
+{
+	unsigned xdim = model.first.xdim, ydim = model.first.ydim, nns = model.first.nns;
+	unsigned nm1 = xdim - 1, ng = nns / 4, Dm1 = nm1 * ydim;
+
+	PredictorModel out = allocate_model({ nm1, ydim, nns });
+	auto flip = [&](const float *gen, float *dst, int f) {
+		for (unsigned r = 0; r < ydim; ++r)
+			for (unsigned c = 0; c < nm1; ++c) {
+				unsigned rr = (f & 2) ? ydim - 1 - r : r, cc = (f & 1) ? nm1 - 1 - c : c;
+				dst[r*nm1 + c] = gen[rr*nm1 + cc];
+			}
+	};
+	auto mat = [&](const float *sg, const float *eg, const float *sb, const float *eb, float *SM, float *EL, float *SMB, float *ELB) {
+		for (int f = 0; f < 4; ++f)
+			for (unsigned gi = 0; gi < ng; ++gi) {
+				unsigned i = f*ng + gi;
+				flip(sg + gi*Dm1, SM + i*Dm1, f);
+				flip(eg + gi*Dm1, EL + i*Dm1, f);
+				SMB[i] = sb[gi]; ELB[i] = eb[gi];
+			}
+	};
+	mat(model.second.softmax_gen_q1, model.second.elliott_gen_q1, model.second.softmax_bias_q1, model.second.elliott_bias_q1,
+	    out.second.softmax_q1, out.second.elliott_q1, out.second.softmax_bias_q1, out.second.elliott_bias_q1);
+	mat(model.second.softmax_gen_q2, model.second.elliott_gen_q2, model.second.softmax_bias_q2, model.second.elliott_bias_q2,
+	    out.second.softmax_q2, out.second.elliott_q2, out.second.softmax_bias_q2, out.second.elliott_bias_q2);
+	return out;
+}
 
 } // namespace
 
@@ -367,6 +400,25 @@ std::unique_ptr<Predictor> create_predictor(const std::pair<const PredictorTrait
 
 	if (!ret)
 		ret = std::make_unique<PredictorC>(model, use_q2);
+
+	assert(ret);
+	return ret;
+}
+
+std::unique_ptr<Predictor> create_symmetric_predictor(const SymmetricPredictorModel &model, bool use_q2, CPUClass cpu)
+{
+	std::unique_ptr<Predictor> ret;
+
+#ifdef ZNEDI3_X86
+	ret = create_symmetric_predictor_x86(model, use_q2, cpu);   // folded AVX-512 for nns >= 64
+#endif
+
+	// Portable fallback (small nns, or no AVX-512): materialise the (N-1)-wide experts and run the
+	// dense C predictor with the target-centred window offset (xdim/2 - 1 of the FULL width).
+	if (!ret) {
+		PredictorModel dense = materialise_symmetric(model);
+		ret = std::make_unique<PredictorC>(dense, use_q2, static_cast<ptrdiff_t>(model.first.xdim) / 2 - 1);
+	}
 
 	assert(ret);
 	return ret;

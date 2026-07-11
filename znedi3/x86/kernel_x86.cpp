@@ -222,11 +222,15 @@ std::unique_ptr<Predictor> create_symmetric_predictor_x86(const SymmetricPredict
 		if (!ret && cpu == CPUClass::AUTO_64B && caps.avx512f && model.first.nns >= 64)
 			ret = create_symmetric_predictor_avx512f(model, use_q2);
 #endif
+		if (!ret && caps.avx2 && caps.fma && model.first.nns >= 32)
+			ret = create_symmetric_predictor_avx2(model, use_q2);
 	} else {
 #ifdef ZNEDI3_X86_AVX512
 		if (!ret && cpu >= CPUClass::X86_AVX512 && model.first.nns >= 64)
 			ret = create_symmetric_predictor_avx512f(model, use_q2);
 #endif
+		if (!ret && cpu >= CPUClass::X86_AVX2 && model.first.nns >= 32)
+			ret = create_symmetric_predictor_avx2(model, use_q2);
 	}
 	return ret;
 }

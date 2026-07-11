@@ -98,6 +98,11 @@ std::unique_ptr<Predictor> create_predictor_avx2(const PredictorModel &model, bo
 	return std::make_unique<PredictorAVX>(model, use_q2);
 }
 
+std::unique_ptr<Predictor> create_symmetric_predictor_avx2(const SymmetricPredictorModel &model, bool use_q2)
+{
+	return std::make_unique<PredictorSymmetricAVX>(model, use_q2);
+}
+
 } // namespace znedi3
 
 #endif // ZNEDI3_X86

@@ -80,6 +80,7 @@ struct SymmetricInterleavedModel {
 
 SymmetricInterleavedModel create_symmetric_interleaved_model(const SymmetricPredictorModel &model);
 
+std::unique_ptr<Predictor> create_symmetric_predictor_avx2(const SymmetricPredictorModel &model, bool use_q2);
 std::unique_ptr<Predictor> create_symmetric_predictor_avx512f(const SymmetricPredictorModel &model, bool use_q2);
 std::unique_ptr<Predictor> create_symmetric_predictor_x86(const SymmetricPredictorModel &model, bool use_q2, CPUClass cpu);
 

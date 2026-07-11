@@ -865,6 +865,147 @@ inline FORCE_INLINE void wae5_x4_avx(const float *softmax, const float *elliott,
 }
 
 
+// h+v-symmetric folded predictor (256-bit, mask-register-free). Non-fused: per-channel folded
+// mat-vec into P, then a Klein-4 combine. Used for nns >= 32 (ng a multiple of 8).
+class PredictorSymmetricAVX final : public Predictor {
+	SymmetricInterleavedModel m_model;
+	double m_inv_filter_size;
+	bool m_use_q2;
+
+	void fold_window(const float *buf, float *xh) const
+	{
+		const int32_t *g = m_model.gather.data();
+		int Rp = static_cast<int>(m_model.Rp);
+		for (int o = 0; o < Rp; o += 8) {
+			__m256 A = _mm256_i32gather_ps(buf, _mm256_loadu_si256((const __m256i *)(g + 0*Rp + o)), 4);
+			__m256 B = _mm256_i32gather_ps(buf, _mm256_loadu_si256((const __m256i *)(g + 1*Rp + o)), 4);
+			__m256 C = _mm256_i32gather_ps(buf, _mm256_loadu_si256((const __m256i *)(g + 2*Rp + o)), 4);
+			__m256 D = _mm256_i32gather_ps(buf, _mm256_loadu_si256((const __m256i *)(g + 3*Rp + o)), 4);
+			__m256 s01=_mm256_add_ps(A,B), d01=_mm256_sub_ps(A,B), s23=_mm256_add_ps(C,D), d23=_mm256_sub_ps(C,D);
+			_mm256_storeu_ps(xh + 0*Rp + o, _mm256_add_ps(s01, s23));
+			_mm256_storeu_ps(xh + 1*Rp + o, _mm256_add_ps(d01, d23));
+			_mm256_storeu_ps(xh + 2*Rp + o, _mm256_sub_ps(s01, s23));
+			_mm256_storeu_ps(xh + 3*Rp + o, _mm256_sub_ps(d01, d23));
+		}
+	}
+
+	void apply4(const float *buf, float *xh4, float *P, float *act, float *mstd, const double *sum, const double *sumsq) const
+	{
+		unsigned nm1 = m_model.xdim - 1, ydim = m_model.ydim, nns = m_model.nns, ng = m_model.ng;
+		int Rp = static_cast<int>(m_model.Rp), twong = 2 * static_cast<int>(ng);
+		float scale[4];
+		for (int p = 0; p < 4; ++p) {
+			double mean = sum[p] * m_inv_filter_size, var = sumsq[p] * m_inv_filter_size - mean * mean;
+			float sd = var < FLT_EPSILON ? 0.0f : static_cast<float>(std::sqrt(var));
+			float inv = sd == 0.0f ? 0.0f : 1.0f / sd;
+			mstd[p] = static_cast<float>(mean); mstd[4+p] = sd; mstd[8+p] = inv; mstd[12+p] = 0.0f; scale[p] = inv;
+		}
+		for (int p = 0; p < 4; ++p) fold_window(buf + static_cast<size_t>(p)*nm1*ydim, xh4 + static_cast<size_t>(p)*4*Rp);
+
+		float *as = act, *ae = act + 4 * static_cast<size_t>(nns);
+		const __m256 q = _mm256_set1_ps(0.25f);
+		for (unsigned qq = 0; qq < (m_use_q2 ? 2u : 1u); ++qq) {
+			const float *wf = qq ? m_model.wfold_q2 : m_model.wfold_q1;
+			const float *bias = qq ? m_model.bias_q2 : m_model.bias_q1;
+			size_t cs = static_cast<size_t>(Rp) * twong;
+			for (int c = 0; c < 4; ++c) {
+				const float *Wc = wf + static_cast<size_t>(c) * cs;
+				const float *X0 = xh4 + 0*4*Rp + c*Rp, *X1 = xh4 + 1*4*Rp + c*Rp, *X2 = xh4 + 2*4*Rp + c*Rp, *X3 = xh4 + 3*4*Rp + c*Rp;
+				for (int b = 0; b < twong; b += 8) {
+					__m256 a0=_mm256_setzero_ps(),a1=_mm256_setzero_ps(),a2=_mm256_setzero_ps(),a3=_mm256_setzero_ps();
+					for (int o = 0; o < Rp; ++o) {
+						__m256 w = _mm256_loadu_ps(Wc + static_cast<size_t>(o)*twong + b);
+						a0 = mm256_fmadd_ps(w, _mm256_broadcast_ss(X0 + o), a0);
+						a1 = mm256_fmadd_ps(w, _mm256_broadcast_ss(X1 + o), a1);
+						a2 = mm256_fmadd_ps(w, _mm256_broadcast_ss(X2 + o), a2);
+						a3 = mm256_fmadd_ps(w, _mm256_broadcast_ss(X3 + o), a3);
+					}
+					_mm256_storeu_ps(P + (static_cast<size_t>(c)*4+0)*twong + b, a0);
+					_mm256_storeu_ps(P + (static_cast<size_t>(c)*4+1)*twong + b, a1);
+					_mm256_storeu_ps(P + (static_cast<size_t>(c)*4+2)*twong + b, a2);
+					_mm256_storeu_ps(P + (static_cast<size_t>(c)*4+3)*twong + b, a3);
+				}
+			}
+			for (int p = 0; p < 4; ++p) {
+				__m256 sc = _mm256_broadcast_ss(&scale[p]);
+				for (int b = 0; b < twong; b += 8) {
+					__m256 P0 = _mm256_loadu_ps(P + (static_cast<size_t>(0)*4+p)*twong + b);
+					__m256 P1 = _mm256_loadu_ps(P + (static_cast<size_t>(1)*4+p)*twong + b);
+					__m256 P2 = _mm256_loadu_ps(P + (static_cast<size_t>(2)*4+p)*twong + b);
+					__m256 P3 = _mm256_loadu_ps(P + (static_cast<size_t>(3)*4+p)*twong + b);
+					__m256 s01=_mm256_add_ps(P0,P1), d01=_mm256_sub_ps(P0,P1), s23=_mm256_add_ps(P2,P3), d23=_mm256_sub_ps(P2,P3);
+					int gg = b < static_cast<int>(ng) ? b : b - static_cast<int>(ng);
+					const float *bp = b < static_cast<int>(ng) ? bias : bias + ng;
+					float *ap = b < static_cast<int>(ng) ? as : ae;
+					__m256 bs = _mm256_loadu_ps(bp + gg);
+					_mm256_storeu_ps(ap + static_cast<size_t>(p)*nns + 0*ng + gg, mm256_fmadd_ps(sc, _mm256_mul_ps(q, _mm256_add_ps(s01,s23)), bs));
+					_mm256_storeu_ps(ap + static_cast<size_t>(p)*nns + 1*ng + gg, mm256_fmadd_ps(sc, _mm256_mul_ps(q, _mm256_add_ps(d01,d23)), bs));
+					_mm256_storeu_ps(ap + static_cast<size_t>(p)*nns + 2*ng + gg, mm256_fmadd_ps(sc, _mm256_mul_ps(q, _mm256_sub_ps(s01,s23)), bs));
+					_mm256_storeu_ps(ap + static_cast<size_t>(p)*nns + 3*ng + gg, mm256_fmadd_ps(sc, _mm256_mul_ps(q, _mm256_sub_ps(d01,d23)), bs));
+				}
+			}
+			softmax_exp_avx(as, 4 * nns);
+			wae5_x4_avx(as, ae, nns, mstd);
+		}
+	}
+public:
+	PredictorSymmetricAVX(const SymmetricPredictorModel &model, bool use_q2) :
+		m_model(create_symmetric_interleaved_model(model)),
+		m_inv_filter_size{ 1.0 / (static_cast<double>(m_model.xdim - 1) * m_model.ydim) },
+		m_use_q2{ use_q2 }
+	{}
+
+	size_t get_tmp_size() const noexcept override
+	{
+		FakeAllocator alloc;
+		alloc.allocate_n<float>(4 * (m_model.xdim - 1) * m_model.ydim);
+		alloc.allocate_n<float>(4 * 4 * m_model.Rp);
+		alloc.allocate_n<float>(4 * 4 * 2 * m_model.ng);
+		alloc.allocate_n<float>(2 * 4 * m_model.nns);
+		return alloc.count();
+	}
+
+	void process(const float * const src[6], float *dst, const unsigned char *prescreen, void *tmp, unsigned n) const noexcept override
+	{
+		unsigned nm1 = m_model.xdim - 1, ydim = m_model.ydim, nns = m_model.nns, wy = 3 - ydim / 2;
+		ptrdiff_t off_x = static_cast<ptrdiff_t>(m_model.window_offset_x);
+
+		LinearAllocator alloc{ tmp };
+		float *buf = alloc.allocate_n<float>(4 * nm1 * ydim);
+		float *xh4 = alloc.allocate_n<float>(4 * 4 * m_model.Rp);
+		float *P = alloc.allocate_n<float>(4 * 4 * 2 * m_model.ng);
+		float *act = alloc.allocate_n<float>(2 * 4 * nns);
+		alignas(32) float mstd[16];
+		double sum[4] = { 0, 0, 0, 0 }, sumsq[4] = { 0, 0, 0, 0 };
+		unsigned gathered_idx[4], num = 0;
+
+		auto gather = [&](ptrdiff_t i) {
+			float *b = buf + static_cast<size_t>(num)*nm1*ydim;
+			double s = 0, sq = 0;
+			for (unsigned r = 0; r < ydim; ++r) {
+				const float *row = src[wy + r] + (i - off_x);
+				for (unsigned c = 0; c < nm1; ++c) { float v = row[c]; b[r*nm1 + c] = v; s += v; sq += static_cast<double>(v)*v; }
+			}
+			sum[num] = s; sumsq[num] = sq; gathered_idx[num] = static_cast<unsigned>(i); ++num;
+		};
+
+		for (ptrdiff_t i = 0; i < static_cast<ptrdiff_t>(n); ++i) {
+			if (prescreen[i]) continue;
+			gather(i);
+			if (num == 4) {
+				apply4(buf, xh4, P, act, mstd, sum, sumsq);
+				for (int p = 0; p < 4; ++p) dst[gathered_idx[p]] = mstd[12 + p] * (m_use_q2 ? 0.5f : 1.0f);
+				num = 0;
+			}
+		}
+		if (num) {
+			apply4(buf, xh4, P, act, mstd, sum, sumsq);
+			for (unsigned p = 0; p < num; ++p) dst[gathered_idx[p]] = mstd[12 + p] * (m_use_q2 ? 0.5f : 1.0f);
+		}
+	}
+};
+
+
 class PredictorAVX final : public Predictor {
 	InterleavedPredictorModel m_model;
 	double m_inv_filter_size;

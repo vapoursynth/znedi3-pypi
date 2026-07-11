@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <limits>
 #include <memory>
+#include <vector>
 #include "kernel.h"
 #include "weights.h"
 #include "znedi3_impl.h"
@@ -320,6 +321,114 @@ PredictorModel materialise_symmetric(const SymmetricPredictorModel &model)
 	return out;
 }
 
+constexpr float SYM_HC[4][4] = { {1,1,1,1},{1,-1,1,-1},{1,1,-1,-1},{1,-1,-1,1} };
+
+// Portable folded h+v-symmetric predictor: gathers the (N-1)-wide window, Klein-4-folds it, runs
+// the folded mat-vec (~4x fewer MACs than dense) + combine, then softmax + wae5. Works for any
+// nns and on any architecture. The weights are the mean-folded generators, Klein-4-transformed.
+class PredictorSymmetricC final : public Predictor {
+	unsigned m_nm1, m_ydim, m_nns, m_ng, m_R;
+	ptrdiff_t m_off_x;
+	bool m_use_q2;
+	std::vector<int> m_pos;                       // [R][4] orbit positions
+	std::vector<float> m_wscale;                  // [R] (0.5 for the centre column)
+	std::vector<float> m_wf_s[2], m_wf_e[2];      // [4][ng][R] folded softmax / elliott, per quality
+	std::vector<float> m_bias_s[2], m_bias_e[2];  // [ng]
+public:
+	PredictorSymmetricC(const SymmetricPredictorModel &model, bool use_q2) : m_use_q2{ use_q2 }
+	{
+		unsigned xdim = model.first.xdim;
+		m_ydim = model.first.ydim; m_nns = model.first.nns;
+		m_nm1 = xdim - 1; m_ng = m_nns / 4; m_off_x = static_cast<ptrdiff_t>(xdim) / 2 - 1;
+		unsigned Dm1 = m_nm1 * m_ydim;
+
+		int C = static_cast<int>(m_nm1 - 1) / 2, N = static_cast<int>(m_nm1);
+		for (int cp = 0; cp < C; ++cp) {
+			int c0 = cp, c1 = N - 1 - cp;
+			for (int rp = 0; rp < static_cast<int>(m_ydim) / 2; ++rp) {
+				int r0 = rp, r1 = static_cast<int>(m_ydim) - 1 - rp;
+				m_pos.insert(m_pos.end(), { r0*N+c0, r0*N+c1, r1*N+c0, r1*N+c1 }); m_wscale.push_back(1.0f);
+			}
+		}
+		for (int rp = 0; rp < static_cast<int>(m_ydim) / 2; ++rp) {
+			int r0 = rp, r1 = static_cast<int>(m_ydim) - 1 - rp;
+			m_pos.insert(m_pos.end(), { r0*N+C, r0*N+C, r1*N+C, r1*N+C }); m_wscale.push_back(0.5f);
+		}
+		m_R = static_cast<unsigned>(m_wscale.size());
+
+		PredictorModel tmp = materialise_symmetric(model);
+		subtract_mean(tmp);
+		for (int q = 0; q < 2; ++q) {
+			const float *SM = q ? tmp.second.softmax_q2 : tmp.second.softmax_q1;
+			const float *EL = q ? tmp.second.elliott_q2 : tmp.second.elliott_q1;
+			const float *SB = q ? tmp.second.softmax_bias_q2 : tmp.second.softmax_bias_q1;
+			const float *EB = q ? tmp.second.elliott_bias_q2 : tmp.second.elliott_bias_q1;
+			m_wf_s[q].assign(4 * m_ng * m_R, 0.0f); m_wf_e[q].assign(4 * m_ng * m_R, 0.0f);
+			m_bias_s[q].assign(m_ng, 0.0f); m_bias_e[q].assign(m_ng, 0.0f);
+			for (unsigned c = 0; c < 4; ++c)
+				for (unsigned gi = 0; gi < m_ng; ++gi)
+					for (unsigned o = 0; o < m_R; ++o) {
+						float s = 0, e = 0;
+						for (int k = 0; k < 4; ++k) { int p = m_pos[o*4 + k]; s += SYM_HC[c][k]*SM[gi*Dm1 + p]; e += SYM_HC[c][k]*EL[gi*Dm1 + p]; }
+						m_wf_s[q][(c*m_ng + gi)*m_R + o] = m_wscale[o] * s;
+						m_wf_e[q][(c*m_ng + gi)*m_R + o] = m_wscale[o] * e;
+					}
+			for (unsigned gi = 0; gi < m_ng; ++gi) { m_bias_s[q][gi] = SB[gi]; m_bias_e[q][gi] = EB[gi]; }
+		}
+	}
+
+	size_t get_tmp_size() const noexcept override { return 0; }
+
+	void process(const float * const src[6], float *dst, const unsigned char *prescreen, void *, unsigned n) const noexcept override
+	{
+		float buf[48 * 6], xh[4 * 72], a[256], e[256];
+		unsigned wy = 3 - m_ydim / 2;
+		double invD = 1.0 / (static_cast<double>(m_nm1) * m_ydim);
+
+		for (ptrdiff_t i = 0; i < static_cast<ptrdiff_t>(n); ++i) {
+			if (prescreen[i])
+				continue;
+
+			double sum = 0, sq = 0;
+			for (unsigned r = 0; r < m_ydim; ++r) {
+				const float *row = src[wy + r] + (i - m_off_x);
+				for (unsigned c = 0; c < m_nm1; ++c) { float v = row[c]; buf[r*m_nm1 + c] = v; sum += v; sq += static_cast<double>(v)*v; }
+			}
+			float mean = static_cast<float>(sum * invD);
+			double var = sq * invD - static_cast<double>(mean) * mean;
+			float sd = var < FLT_EPSILON ? 0.0f : static_cast<float>(std::sqrt(var));
+			float scale = sd == 0.0f ? 0.0f : 1.0f / sd;
+
+			for (unsigned o = 0; o < m_R; ++o)
+				for (unsigned c = 0; c < 4; ++c) { float s = 0; for (int k = 0; k < 4; ++k) s += SYM_HC[c][k]*buf[m_pos[o*4 + k]]; xh[c*m_R + o] = s; }
+
+			float out = 0.0f;
+			for (int q = 0; q < (m_use_q2 ? 2 : 1); ++q) {
+				const float *wfs = m_wf_s[q].data(), *wfe = m_wf_e[q].data(), *bs = m_bias_s[q].data(), *be = m_bias_e[q].data();
+				for (unsigned gi = 0; gi < m_ng; ++gi) {
+					float Ps[4], Pe[4];
+					for (unsigned c = 0; c < 4; ++c) {
+						const float *ws = wfs + (c*m_ng + gi)*m_R, *we = wfe + (c*m_ng + gi)*m_R, *x = xh + c*m_R;
+						float ps = 0, pe = 0;
+						for (unsigned o = 0; o < m_R; ++o) { ps += x[o]*ws[o]; pe += x[o]*we[o]; }
+						Ps[c] = ps; Pe[c] = pe;
+					}
+					for (int f = 0; f < 4; ++f) {
+						float ds = 0, de = 0;
+						for (int c = 0; c < 4; ++c) { ds += SYM_HC[c][f]*Ps[c]; de += SYM_HC[c][f]*Pe[c]; }
+						a[f*m_ng + gi] = 0.25f*ds*scale + bs[gi];
+						e[f*m_ng + gi] = 0.25f*de*scale + be[gi];
+					}
+				}
+				float vsum = 0, wsum = 0;
+				for (unsigned k = 0; k < m_nns; ++k) { float sx = softmax_exp(a[k]); vsum += sx * elliott(e[k]); wsum += sx; }
+				out += wsum > 1e-10f ? 5.0f*vsum/wsum*sd + mean : mean;
+			}
+			dst[i] = out / (m_use_q2 ? 2 : 1);
+		}
+	}
+};
+
 } // namespace
 
 
@@ -413,12 +522,9 @@ std::unique_ptr<Predictor> create_symmetric_predictor(const SymmetricPredictorMo
 	ret = create_symmetric_predictor_x86(model, use_q2, cpu);   // folded AVX-512 for nns >= 64
 #endif
 
-	// Portable fallback (small nns, or no AVX-512): materialise the (N-1)-wide experts and run the
-	// dense C predictor with the target-centred window offset (xdim/2 - 1 of the FULL width).
-	if (!ret) {
-		PredictorModel dense = materialise_symmetric(model);
-		ret = std::make_unique<PredictorC>(dense, use_q2, static_cast<ptrdiff_t>(model.first.xdim) / 2 - 1);
-	}
+	// Portable folded fallback (small nns, or no AVX2/AVX-512 SIMD path).
+	if (!ret)
+		ret = std::make_unique<PredictorSymmetricC>(model, use_q2);
 
 	assert(ret);
 	return ret;

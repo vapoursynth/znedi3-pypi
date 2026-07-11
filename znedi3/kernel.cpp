@@ -516,6 +516,16 @@ std::unique_ptr<Predictor> create_predictor(const std::pair<const PredictorTrait
 
 std::unique_ptr<Predictor> create_symmetric_predictor(const SymmetricPredictorModel &model, bool use_q2, CPUClass cpu)
 {
+	// Performance gate: the folded predictor only beats the dense one at nns >= 128. Below that its
+	// fixed per-pixel window-fold + combine overhead isn't amortised by the smaller matvec, and
+	// nns < 64 additionally has no mask-free AVX-512 path (it falls to AVX2/scalar while the dense
+	// predictor stays AVX-512), so it regresses -- measured single-thread ~0.16x (nns16), ~0.4x
+	// (nns32), ~0.7x (nns64), only marginally rescued multi-threaded. Returning nullptr makes the
+	// caller fall back to the dense predictor, which is byte-identical to stock at full speed. At
+	// nns >= 128 the fold is a clean win (~1.1-2.3x). This gate is independent of the weight file.
+	if (model.first.nns < 128)
+		return nullptr;
+
 	std::unique_ptr<Predictor> ret;
 
 #ifdef ZNEDI3_X86

@@ -49,7 +49,7 @@ ET = {0:"abs",1:"mse"}
 TESTS = [
     (4, 4, 1, 1, "keep"),   # mse 8x4  nns256  -- narrowest, best fold
     (3, 3, 1, 1, "keep"),   # mse 48x6 nns128  -- widest kept
-    (0, 2, 0, 1, "keep"),   # abs 8x6  nns64
+    (0, 2, 0, 1, "drop"),   # abs 8x6  nns64  -- SPEED-GATED (nns<128) -> dense fallback, byte-identical
     (6, 4, 0, 1, "keep"),   # abs 32x4 nns256
     (4, 4, 1, 2, "keep"),   # mse 8x4  nns256 qual2 -- exercises q2 fold
     (2, 0, 0, 1, "drop"),   # abs 32x6 nns16   -- solidly dropped

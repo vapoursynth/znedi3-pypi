@@ -514,7 +514,7 @@ std::unique_ptr<Predictor> create_predictor(const std::pair<const PredictorTrait
 	return ret;
 }
 
-std::unique_ptr<Predictor> create_symmetric_predictor(const SymmetricPredictorModel &model, bool use_q2, CPUClass cpu)
+std::unique_ptr<Predictor> create_symmetric_predictor(const SymmetricPredictorModel &model, bool use_q2, CPUClass cpu, bool use_int16)
 {
 	// Performance gate: the folded predictor only beats the dense one at nns >= 128. Below that its
 	// fixed per-pixel window-fold + combine overhead isn't amortised by the smaller matvec, and
@@ -529,7 +529,7 @@ std::unique_ptr<Predictor> create_symmetric_predictor(const SymmetricPredictorMo
 	std::unique_ptr<Predictor> ret;
 
 #ifdef ZNEDI3_X86
-	ret = create_symmetric_predictor_x86(model, use_q2, cpu);   // folded AVX-512 for nns >= 64
+	ret = create_symmetric_predictor_x86(model, use_q2, cpu, use_int16);   // folded AVX-512 / int16-VNNI for nns >= 64
 #endif
 
 	// Portable folded fallback (small nns, or no AVX2/AVX-512 SIMD path).

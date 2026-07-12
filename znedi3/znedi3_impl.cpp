@@ -496,15 +496,27 @@ std::unique_ptr<znedi3_filter::filters> znedi3_filter::setup_filters(const NNEDI
 	const PredictorModelSet &model_set = (params.etype == ZNEDI3_ETYPE_MSE) ? weights.mse_models() : weights.abs_models();
 	assert(model_set.find(traits) != model_set.end());
 
+	// int16-VNNI mat-vec, opt-in via int16_predictor (VNNI-gated; auto fp32 fallback on non-VNNI CPUs).
+	// Applies to both the dense and the hvsym-folded paths. On float/half input it is a precision
+	// downgrade, so it errors there unless silent_fallback keeps fp32.
+	bool use_int16 = params.int16_predict != 0;
+	if (use_int16 && (type == PixelType::HALF || type == PixelType::FLOAT)) {
+		if (!params.silent_fallback)
+			throw std::runtime_error{ "int16_predictor requested on float input, where it is a precision downgrade; "
+			                          "use integer input, omit int16_predictor, or set silent_fallback=True" };
+		use_int16 = false;
+	}
+
 	std::unique_ptr<Predictor> predictor;
 
-	// hvsym (h+v-symmetric) predictor, if requested. A config the file/gate does not cover is an error
-	// unless silent_fallback lets us drop to the dense model instead.
+	// hvsym (h+v-symmetric) predictor, if requested; with int16_predictor it uses the folded int16-VNNI
+	// kernel (symmetry + int16 stacked). A config the file/gate does not cover is an error unless
+	// silent_fallback drops to the dense model instead.
 	if (params.symmetric) {
 		const SymmetricPredictorModelSet &sym_set = (params.etype == ZNEDI3_ETYPE_MSE) ? weights.sym_mse_models() : weights.sym_abs_models();
 		auto it = sym_set.find(traits);
 		if (it != sym_set.end())
-			predictor = create_symmetric_predictor(*it, params.qual >= ZNEDI3_QUAL_2, cpu);
+			predictor = create_symmetric_predictor(*it, params.qual >= ZNEDI3_QUAL_2, cpu, use_int16);
 		if (!predictor && !params.silent_fallback)
 			throw std::runtime_error{ "hvsym weights unavailable for this nsize/nns/etype "
 			                          "(dropped from the file, or below the nns>=128 speed gate); "
@@ -512,18 +524,8 @@ std::unique_ptr<znedi3_filter::filters> znedi3_filter::setup_filters(const NNEDI
 	}
 
 	// Dense predictor -- also the fall-back when the symmetric predictor was unavailable + silent_fallback.
-	if (!predictor) {
-		// int16-VNNI mat-vec, opt-in via int16_predictor (VNNI-gated; auto fp32 fallback on non-VNNI CPUs).
-		// On float/half input it is a precision downgrade, so it errors there unless silent_fallback keeps fp32.
-		bool use_int16 = params.int16_predict != 0;
-		if (use_int16 && (type == PixelType::HALF || type == PixelType::FLOAT)) {
-			if (!params.silent_fallback)
-				throw std::runtime_error{ "int16_predictor requested on float input, where it is a precision downgrade; "
-				                          "use integer input, omit int16_predictor, or set silent_fallback=True" };
-			use_int16 = false;
-		}
+	if (!predictor)
 		predictor = create_predictor(*model_set.find(traits), params.qual >= ZNEDI3_QUAL_2, cpu, use_int16);
-	}
 
 	interpolate_func interpolate = nullptr;
 	if (params.show_mask >= 2)

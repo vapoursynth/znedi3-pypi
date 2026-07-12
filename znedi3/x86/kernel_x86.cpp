@@ -210,7 +210,7 @@ SymmetricInterleavedModel create_symmetric_interleaved_model(const SymmetricPred
 	return out;
 }
 
-std::unique_ptr<Predictor> create_symmetric_predictor_x86(const SymmetricPredictorModel &model, bool use_q2, CPUClass cpu)
+std::unique_ptr<Predictor> create_symmetric_predictor_x86(const SymmetricPredictorModel &model, bool use_q2, CPUClass cpu, bool use_int16)
 {
 	X86Capabilities caps = query_x86_capabilities();
 	std::unique_ptr<Predictor> ret;
@@ -219,6 +219,8 @@ std::unique_ptr<Predictor> create_symmetric_predictor_x86(const SymmetricPredict
 	// smaller nns fall through to the portable C folded predictor.
 	if (cpu_is_autodetect(cpu)) {
 #ifdef ZNEDI3_X86_AVX512
+		if (!ret && use_int16 && cpu == CPUClass::AUTO_64B && caps.avx512f && caps.avx512vnni && model.first.nns >= 64)
+			ret = create_symmetric_predictor_int16_avx512vnni(model, use_q2);
 		if (!ret && cpu == CPUClass::AUTO_64B && caps.avx512f && model.first.nns >= 64)
 			ret = create_symmetric_predictor_avx512f(model, use_q2);
 #endif

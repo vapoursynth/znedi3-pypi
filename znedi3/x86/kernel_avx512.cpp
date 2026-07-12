@@ -1156,6 +1156,167 @@ public:
 	}
 };
 
+// int16 folded mat-vec + Klein-4 combine (vpdpwssd). wfi[c]: int16 pairs [Ph][2ng]; xhi[c]: [4px][Ph];
+// invSW: per-gen 1/scale [2ng]; invSX: per-pixel 1/scale. Dequant recovers the fp32 fold dot exactly.
+inline FORCE_INLINE void sym_folded_matvec_i16(const uint32_t * const wfi[4], const uint32_t * const xhi[4], int Ph, int ng,
+                                               const float *invSW, const float invSX[4],
+                                               const float *sbias, const float *ebias, const float scale[4], float *as, float *ae)
+{
+	int twong = 2 * ng, nns = 4 * ng;
+	const __m512 q = _mm512_set1_ps(0.25f);
+	for (int b = 0; b < twong; b += 16) {
+		__m512i a00=_mm512_setzero_si512(),a01=_mm512_setzero_si512(),a02=_mm512_setzero_si512(),a03=_mm512_setzero_si512();
+		__m512i a10=_mm512_setzero_si512(),a11=_mm512_setzero_si512(),a12=_mm512_setzero_si512(),a13=_mm512_setzero_si512();
+		__m512i a20=_mm512_setzero_si512(),a21=_mm512_setzero_si512(),a22=_mm512_setzero_si512(),a23=_mm512_setzero_si512();
+		__m512i a30=_mm512_setzero_si512(),a31=_mm512_setzero_si512(),a32=_mm512_setzero_si512(),a33=_mm512_setzero_si512();
+		const uint32_t *W0=wfi[0]+b,*W1=wfi[1]+b,*W2=wfi[2]+b,*W3=wfi[3]+b;
+		const uint32_t *X0=xhi[0],*X1=xhi[1],*X2=xhi[2],*X3=xhi[3];
+		for (int op = 0; op < Ph; ++op) {
+			__m512i w;
+			w=_mm512_loadu_si512(W0+(size_t)op*twong); a00=_mm512_dpwssd_epi32(a00,w,_mm512_set1_epi32((int)X0[0*Ph+op]));a01=_mm512_dpwssd_epi32(a01,w,_mm512_set1_epi32((int)X0[1*Ph+op]));a02=_mm512_dpwssd_epi32(a02,w,_mm512_set1_epi32((int)X0[2*Ph+op]));a03=_mm512_dpwssd_epi32(a03,w,_mm512_set1_epi32((int)X0[3*Ph+op]));
+			w=_mm512_loadu_si512(W1+(size_t)op*twong); a10=_mm512_dpwssd_epi32(a10,w,_mm512_set1_epi32((int)X1[0*Ph+op]));a11=_mm512_dpwssd_epi32(a11,w,_mm512_set1_epi32((int)X1[1*Ph+op]));a12=_mm512_dpwssd_epi32(a12,w,_mm512_set1_epi32((int)X1[2*Ph+op]));a13=_mm512_dpwssd_epi32(a13,w,_mm512_set1_epi32((int)X1[3*Ph+op]));
+			w=_mm512_loadu_si512(W2+(size_t)op*twong); a20=_mm512_dpwssd_epi32(a20,w,_mm512_set1_epi32((int)X2[0*Ph+op]));a21=_mm512_dpwssd_epi32(a21,w,_mm512_set1_epi32((int)X2[1*Ph+op]));a22=_mm512_dpwssd_epi32(a22,w,_mm512_set1_epi32((int)X2[2*Ph+op]));a23=_mm512_dpwssd_epi32(a23,w,_mm512_set1_epi32((int)X2[3*Ph+op]));
+			w=_mm512_loadu_si512(W3+(size_t)op*twong); a30=_mm512_dpwssd_epi32(a30,w,_mm512_set1_epi32((int)X3[0*Ph+op]));a31=_mm512_dpwssd_epi32(a31,w,_mm512_set1_epi32((int)X3[1*Ph+op]));a32=_mm512_dpwssd_epi32(a32,w,_mm512_set1_epi32((int)X3[2*Ph+op]));a33=_mm512_dpwssd_epi32(a33,w,_mm512_set1_epi32((int)X3[3*Ph+op]));
+		}
+		__m512 isw = _mm512_loadu_ps(invSW + b);
+		int gg = b < ng ? b : b - ng; const float *bias = b < ng ? sbias : ebias; float *act = b < ng ? as : ae; __m512 bs = _mm512_loadu_ps(bias + gg);
+		#define ZSYMI(p,A0,A1,A2,A3){ __m512 dq=_mm512_mul_ps(isw,_mm512_set1_ps(invSX[p])); \
+			__m512 P0=_mm512_mul_ps(_mm512_cvtepi32_ps(A0),dq),P1=_mm512_mul_ps(_mm512_cvtepi32_ps(A1),dq),P2=_mm512_mul_ps(_mm512_cvtepi32_ps(A2),dq),P3=_mm512_mul_ps(_mm512_cvtepi32_ps(A3),dq); \
+			__m512 s01=_mm512_add_ps(P0,P1),d01=_mm512_sub_ps(P0,P1),s23=_mm512_add_ps(P2,P3),d23=_mm512_sub_ps(P2,P3); __m512 sc=_mm512_set1_ps(scale[p]); \
+			_mm512_storeu_ps(act+(size_t)(p)*nns+0*ng+gg,_mm512_fmadd_ps(sc,_mm512_mul_ps(q,_mm512_add_ps(s01,s23)),bs)); _mm512_storeu_ps(act+(size_t)(p)*nns+1*ng+gg,_mm512_fmadd_ps(sc,_mm512_mul_ps(q,_mm512_add_ps(d01,d23)),bs)); \
+			_mm512_storeu_ps(act+(size_t)(p)*nns+2*ng+gg,_mm512_fmadd_ps(sc,_mm512_mul_ps(q,_mm512_sub_ps(s01,s23)),bs)); _mm512_storeu_ps(act+(size_t)(p)*nns+3*ng+gg,_mm512_fmadd_ps(sc,_mm512_mul_ps(q,_mm512_sub_ps(d01,d23)),bs)); }
+		ZSYMI(0,a00,a10,a20,a30) ZSYMI(1,a01,a11,a21,a31) ZSYMI(2,a02,a12,a22,a32) ZSYMI(3,a03,a13,a23,a33)
+		#undef ZSYMI
+	}
+}
+
+// hvsym + int16-VNNI: the folded predictor with an int16 mat-vec. Subtract the window mean (the folded
+// weights sum to zero, so this is exact and keeps values in int16 range), fold, quantise the folded
+// window per-window and the folded generators per-generator, run vpdpwssd, dequantise, Klein-4 combine.
+class PredictorSymmetricInt16VNNIAVX512 final : public Predictor {
+	static constexpr float WCAP = 8192.0f, XCAP = 2048.0f;   // WCAP*XCAP*Rp(<=80) < 2^31
+	SymmetricInterleavedModel m_model;
+	AlignedVector<uint32_t> m_qwf_q1, m_qwf_q2;              // int16 folded weights [4][Ph][2ng]
+	AlignedVector<float> m_invSW_q1, m_invSW_q2;            // per-gen 1/scale [2ng]
+	double m_inv_filter_size;
+	bool m_use_q2;
+
+	void quantize(const float *wfold, AlignedVector<uint32_t> &out, AlignedVector<float> &invSW) const
+	{
+		unsigned Rp = m_model.Rp, twong = 2 * m_model.ng, Ph = Rp / 2; size_t cs = (size_t)Rp * twong;
+		invSW.resize(twong);
+		std::vector<float> SWg(twong);
+		for (unsigned g = 0; g < twong; ++g) {
+			float mx = 1e-9f;
+			for (int c = 0; c < 4; ++c) for (unsigned o = 0; o < Rp; ++o) mx = std::max(mx, std::fabs(wfold[(size_t)c*cs + (size_t)o*twong + g]));
+			SWg[g] = WCAP / mx; invSW[g] = 1.0f / SWg[g];
+		}
+		out.resize((size_t)4 * Ph * twong);
+		auto q = [](float f, float s) -> uint16_t { int v = (int)std::lrintf(f * s); return (uint16_t)(int16_t)(v > 32767 ? 32767 : (v < -32768 ? -32768 : v)); };
+		for (int c = 0; c < 4; ++c) for (unsigned op = 0; op < Ph; ++op) for (unsigned g = 0; g < twong; ++g)
+			out[((size_t)c*Ph + op)*twong + g] = q(wfold[(size_t)c*cs + (size_t)(2*op)*twong + g], SWg[g]) | ((uint32_t)q(wfold[(size_t)c*cs + (size_t)(2*op+1)*twong + g], SWg[g]) << 16);
+	}
+
+	void fold_window(const float *buf, float *xh0, float *xh1, float *xh2, float *xh3) const
+	{
+		const int32_t *g = m_model.gather.data(); int Rp = (int)m_model.Rp;
+		for (int o = 0; o < Rp; o += 16) {
+			__m512 A = _mm512_i32gather_ps(_mm512_loadu_si512(g + 0*Rp + o), buf, 4);
+			__m512 B = _mm512_i32gather_ps(_mm512_loadu_si512(g + 1*Rp + o), buf, 4);
+			__m512 C = _mm512_i32gather_ps(_mm512_loadu_si512(g + 2*Rp + o), buf, 4);
+			__m512 D = _mm512_i32gather_ps(_mm512_loadu_si512(g + 3*Rp + o), buf, 4);
+			__m512 s01=_mm512_add_ps(A,B), d01=_mm512_sub_ps(A,B), s23=_mm512_add_ps(C,D), d23=_mm512_sub_ps(C,D);
+			_mm512_storeu_ps(xh0 + o, _mm512_add_ps(s01,s23)); _mm512_storeu_ps(xh1 + o, _mm512_add_ps(d01,d23));
+			_mm512_storeu_ps(xh2 + o, _mm512_sub_ps(s01,s23)); _mm512_storeu_ps(xh3 + o, _mm512_sub_ps(d01,d23));
+		}
+	}
+
+	void apply4(float *buf, float *const xhc[4], float *act, float *mstd, const double *sum, const double *sumsq) const
+	{
+		unsigned nm1 = m_model.xdim - 1, ydim = m_model.ydim, nns = m_model.nns, ng = m_model.ng;
+		int Rp = (int)m_model.Rp, twong = 2 * (int)ng, Ph = Rp / 2, fs = (int)(nm1 * ydim);
+		float scale[4], meanv[4];
+		for (int p = 0; p < 4; ++p) {
+			double mean = sum[p] * m_inv_filter_size, var = sumsq[p] * m_inv_filter_size - mean * mean;
+			float sd = var < FLT_EPSILON ? 0.0f : (float)std::sqrt(var); float inv = sd == 0.0f ? 0.0f : 1.0f / sd;
+			mstd[0+p] = (float)mean; mstd[4+p] = sd; mstd[8+p] = inv; mstd[12+p] = 0.0f; scale[p] = inv; meanv[p] = (float)mean;
+		}
+		for (int p = 0; p < 4; ++p) {   // subtract the window mean (exact: folded rows sum to zero) to keep int16 range
+			__m512 m = _mm512_set1_ps(meanv[p]); float *b = buf + (size_t)p*fs; int k = 0;
+			for (; k + 16 <= fs; k += 16) _mm512_storeu_ps(b+k, _mm512_sub_ps(_mm512_loadu_ps(b+k), m));
+			for (; k < fs; ++k) b[k] -= meanv[p];
+		}
+		for (int p = 0; p < 4; ++p) fold_window(buf + (size_t)p*fs, xhc[0]+p*Rp, xhc[1]+p*Rp, xhc[2]+p*Rp, xhc[3]+p*Rp);
+
+		alignas(64) uint32_t xhi[4 * 4 * (80 / 2)];   // [4 channels][4 pixels][Ph<=40]
+		float invSX[4]; const __m512i absmask = _mm512_set1_epi32(0x7FFFFFFF);
+		for (int p = 0; p < 4; ++p) {
+			__m512 vmax = _mm512_setzero_ps();
+			for (int c = 0; c < 4; ++c) { const float *x = xhc[c] + p*Rp; for (int o = 0; o < Rp; o += 16) vmax = _mm512_max_ps(vmax, _mm512_castsi512_ps(_mm512_and_si512(_mm512_castps_si512(_mm512_loadu_ps(x+o)), absmask))); }
+			float mx = _mm512_reduce_max_ps(vmax); if (mx < 1e-9f) mx = 1e-9f;
+			float sx = XCAP / mx; invSX[p] = 1.0f / sx; __m512 vs = _mm512_set1_ps(sx);
+			for (int c = 0; c < 4; ++c) { const float *x = xhc[c] + p*Rp; uint32_t *o16 = xhi + ((size_t)c*4 + p)*Ph;
+				for (int o = 0; o < Rp; o += 16) _mm256_storeu_si256((__m256i*)(o16 + o/2), _mm512_cvtsepi32_epi16(_mm512_cvtps_epi32(_mm512_mul_ps(_mm512_loadu_ps(x+o), vs)))); }
+		}
+		const uint32_t *xhip[4] = { xhi + 0*4*Ph, xhi + 1*4*Ph, xhi + 2*4*Ph, xhi + 3*4*Ph };
+		float *as = act, *ae = act + 4 * (size_t)nns;
+		for (unsigned qq = 0; qq < (m_use_q2 ? 2u : 1u); ++qq) {
+			const uint32_t *qwf = (qq ? m_qwf_q2 : m_qwf_q1).data();
+			const float *invSW = (qq ? m_invSW_q2 : m_invSW_q1).data();
+			const float *bias = qq ? m_model.bias_q2 : m_model.bias_q1;
+			size_t cs = (size_t)Ph * twong;
+			const uint32_t *wfc[4] = { qwf, qwf + cs, qwf + 2*cs, qwf + 3*cs };
+			sym_folded_matvec_i16(wfc, xhip, Ph, (int)ng, invSW, invSX, bias, bias + ng, scale, as, ae);
+			softmax_exp(as, 4 * nns);
+			wae5_x4(as, ae, nns, mstd);
+		}
+	}
+public:
+	PredictorSymmetricInt16VNNIAVX512(const SymmetricPredictorModel &model, bool use_q2) :
+		m_model(create_symmetric_interleaved_model(model)),
+		m_inv_filter_size{ 1.0 / (static_cast<double>(m_model.xdim - 1) * m_model.ydim) },
+		m_use_q2{ use_q2 }
+	{
+		quantize(m_model.wfold_q1, m_qwf_q1, m_invSW_q1);
+		if (use_q2) quantize(m_model.wfold_q2, m_qwf_q2, m_invSW_q2);
+	}
+
+	size_t get_tmp_size() const noexcept override
+	{
+		FakeAllocator alloc;
+		alloc.allocate_n<float>(4 * (m_model.xdim - 1) * m_model.ydim);
+		alloc.allocate_n<float>(4 * 4 * m_model.Rp);
+		alloc.allocate_n<float>(2 * 4 * m_model.nns);
+		return alloc.count();
+	}
+
+	void process(const float * const src[6], float *dst, const unsigned char *prescreen, void *tmp, unsigned n) const noexcept override
+	{
+		unsigned nm1 = m_model.xdim - 1, ydim = m_model.ydim, nns = m_model.nns;
+		unsigned wy = 3 - ydim / 2; ptrdiff_t off_x = (ptrdiff_t)m_model.window_offset_x;
+		LinearAllocator alloc{ tmp };
+		float *buf = alloc.allocate_n<float>(4 * nm1 * ydim);
+		float *xh = alloc.allocate_n<float>(4 * 4 * m_model.Rp);
+		float *act = alloc.allocate_n<float>(2 * 4 * nns);
+		float *xhc[4] = { xh, xh + 4*m_model.Rp, xh + 8*m_model.Rp, xh + 12*m_model.Rp };
+		alignas(64) float mstd[16]; double sum[4] = {0,0,0,0}, sumsq[4] = {0,0,0,0}; unsigned gathered_idx[4], num = 0;
+		auto gather = [&](ptrdiff_t i) {
+			float *b = buf + (size_t)num * nm1 * ydim; double s = 0, sq = 0;
+			for (unsigned r = 0; r < ydim; ++r) { const float *row = src[wy + r] + (i - off_x);
+				for (unsigned c = 0; c < nm1; ++c) { float v = row[c]; b[r*nm1 + c] = v; s += v; sq += (double)v * v; } }
+			sum[num] = s; sumsq[num] = sq; gathered_idx[num] = (unsigned)i; ++num;
+		};
+		for (ptrdiff_t i = 0; i < (ptrdiff_t)n; ++i) {
+			if (prescreen[i]) continue;
+			gather(i);
+			if (num == 4) { apply4(buf, xhc, act, mstd, sum, sumsq);
+				for (int p = 0; p < 4; ++p) dst[gathered_idx[p]] = mstd[12 + p] * (m_use_q2 ? 0.5f : 1.0f); num = 0; }
+		}
+		if (num) { apply4(buf, xhc, act, mstd, sum, sumsq);
+			for (unsigned p = 0; p < num; ++p) dst[gathered_idx[p]] = mstd[12 + p] * (m_use_q2 ? 0.5f : 1.0f); }
+	}
+};
+
 
 template <unsigned N>
 class PredictorAVX512F final : public Predictor {
@@ -1580,6 +1741,11 @@ std::unique_ptr<Predictor> create_predictor_avx512f(const PredictorModel &model,
 std::unique_ptr<Predictor> create_symmetric_predictor_avx512f(const SymmetricPredictorModel &model, bool use_q2)
 {
 	return std::make_unique<PredictorSymmetricAVX512F>(model, use_q2);
+}
+
+std::unique_ptr<Predictor> create_symmetric_predictor_int16_avx512vnni(const SymmetricPredictorModel &model, bool use_q2)
+{
+	return std::make_unique<PredictorSymmetricInt16VNNIAVX512>(model, use_q2);
 }
 
 std::unique_ptr<Predictor> create_predictor_int16_avx512vnni(const PredictorModel &model, bool use_q2)

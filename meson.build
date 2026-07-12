@@ -147,6 +147,6 @@ shared_module('znedi3',
 )
 
 install_data(
-    'nnedi3_weights.bin',
+    ['nnedi3_weights.bin', 'nnedi3_weights_hvsym.bin'],
     install_dir: py.get_install_dir() / 'vapoursynth/plugins',
 )

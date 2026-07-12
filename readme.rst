@@ -17,12 +17,24 @@ This is a port of tritical's nnedi3 filter.
 Usage
 =====
 
-The file ``nnedi3_weights.bin`` is required. It must be in the same
-directory as nnedi3.
+The file ``nnedi3_weights.bin`` is always required and must be in the
+same directory as nnedi3. ``nnedi3_weights_hvsym.bin`` must be there too
+unless *new_weights* is False. Both are loaded automatically; a missing
+required file is an error.
+
+When *new_weights* is True (the default), the two largest *nns* settings
+(128 and 256 neurons) use a folded predictor that exploits the network's
+horizontal and vertical mirror symmetry to run roughly 4x less
+arithmetic. It is a symmetrised approximation: most output pixels are
+identical to the original predictor and the mean difference is well
+under one 8-bit code value, but individual pixels can differ by more
+(tens of code values in the worst case). Configurations the folded file
+does not cover fall back to the original predictor automatically. Set
+*new_weights* to False to use the original predictor everywhere.
 
 ::
 
-   nnedi3.nnedi3(clip clip, int field[, bint dh=False, int[] planes=[0, 1, 2], int nsize=6, int nns=1, int qual=1, int etype=0, int pscrn=2, bint opt=True, bint int16_prescreener=True, bint int16_predictor=True, int exp=0, bint show_mask=False])
+   nnedi3.nnedi3(clip clip, int field[, bint dh=False, int[] planes=[0, 1, 2], int nsize=6, int nns=1, int qual=1, int etype=0, int pscrn=2, bint opt=True, bint int16_prescreener=True, bint int16_predictor=True, int exp=0, bint show_mask=False, bint new_weights=True, bint silent_fallback=True])
 
 Parameters:
     *clip*
@@ -166,12 +178,21 @@ Parameters:
         Default: True.
 
     *int16_predictor*
-        If True, the predictor will perform the dot product
-        calculations using 16 bit integers. Otherwise, it will use
-        single precision floats.
+        If True, the predictor performs its matrix-vector products
+        using 16 bit integers (an int16 VNNI kernel, roughly twice the
+        throughput of the float path). It applies both to the plain
+        predictor and to the automatic folded predictor.
 
-        This parameter is ignored when the input has more than 15 bits
-        per sample.
+        It requires automatic CPU dispatch (*opt* True and no *x_cpu*
+        override) on a CPU with AVX-512 and AVX-512-VNNI. On any other
+        CPU the float path is used transparently.
+
+        Unlike the float path it is a small precision reduction. On
+        integer input (8..16 bits) the reduction is benign (well below
+        the network's own prediction error). On float or half input it
+        would be a genuine downgrade, so with *silent_fallback* False it
+        raises an error there; with *silent_fallback* True (the default)
+        it is simply ignored.
 
         Default: True.
 
@@ -187,6 +208,35 @@ Parameters:
         neural network are instead set to white.
 
         Default: False.
+
+    *new_weights*
+        Selects between the two weight sets. When True (the default) the
+        folded h+v-symmetric predictor from ``nnedi3_weights_hvsym.bin``
+        is used for the configurations it covers (the two largest *nns*
+        settings), which is faster but a symmetrised approximation of the
+        original network (see above). When False the original dense
+        predictor from ``nnedi3_weights.bin`` is used everywhere, and
+        ``nnedi3_weights_hvsym.bin`` is not needed.
+
+        Default: True.
+        Governs what happens when an acceleration cannot be used for a
+        reason other than CPU capability or a missing weights file. When
+        True (the default) the filter silently uses the slower path
+        instead:
+
+        * a configuration the folded file does not cover, or that is
+          below the *nns* gate, uses the plain predictor;
+        * *int16_predictor* on float or half input is ignored.
+
+        When False such a case is a hard error instead, so you can tell
+        that the fast path did not engage.
+
+        Unavailability caused by the CPU lacking AVX-512-VNNI always
+        falls back to the float path silently, regardless of this
+        setting. A missing weights file is always an error, regardless
+        of this setting.
+
+        Default: True.
 
 
 Compilation (Linux)
@@ -204,10 +254,10 @@ Compile the library:
    make X86=1
 
    
-To install, copy :code:`vsznedi3.so` and :code:`nnedi3_weights.bin` to the vapoursynth plugin folder (usually :code:`/usr/lib/x86_64-linux-gnu/vapoursynth/`):
+To install, copy :code:`vsznedi3.so`, :code:`nnedi3_weights.bin` and (optionally, for the folded predictor) :code:`nnedi3_weights_hvsym.bin` to the vapoursynth plugin folder (usually :code:`/usr/lib/x86_64-linux-gnu/vapoursynth/`):
 ::
 
-   sudo cp nnedi3_weights.bin vsznedi3.so /usr/lib/x86_64-linux-gnu/vapoursynth/
+   sudo cp nnedi3_weights.bin nnedi3_weights_hvsym.bin vsznedi3.so /usr/lib/x86_64-linux-gnu/vapoursynth/
 
 There is also a test application which can be built to check the efficiency of the plugin kernels optimized for different SIMD instructions:
 ::

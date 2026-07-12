@@ -102,28 +102,34 @@ public:
 	void init(const ConstMap &in, const Map &out, const Core &core) override
 	{
 		std::string plugin_path = core.get_plugin_by_id(PLUGIN_ID).path();
+		std::string plugin_dir = plugin_path.substr(0, plugin_path.find_last_of('/'));
 
 		std::string weights_path;
 #ifdef NNEDI3_WEIGHTS_PATH
 		weights_path = NNEDI3_WEIGHTS_PATH;
 #else
-		weights_path = plugin_path.substr(0, plugin_path.find_last_of('/')) + "/nnedi3_weights.bin";
+		weights_path = plugin_dir + "/nnedi3_weights.bin";
 #endif
-		if (in.contains("x_nnedi3_weights_bin"))
-			weights_path = in.get_prop<std::string>("x_nnedi3_weights_bin");
-
 		std::unique_ptr<znedi3_weights, ZNEDI3WeightsFree> nnedi3_weights{ znedi3_weights_from_file(weights_path.c_str()) };
 		if (!nnedi3_weights)
-			throw std::runtime_error{ "error reading weights" };
+			throw std::runtime_error{ "error reading weights from '" + weights_path + "'" };
 
-		// Optional h+v-symmetric generator weights (prescreener + normal predictors stay from the
-		// original file above). Selecting this file enables the folded symmetric predictor path.
-		bool use_symmetric = false;
-		if (in.contains("hvsym")) {
-			std::string hvsym_path = in.get_prop<std::string>("hvsym");
+		// new_weights selects the folded h+v-symmetric predictor (the "new" weights) over the original
+		// dense predictor. When enabled, the folded generator weights are loaded from next to the
+		// plugin (layered on the file above, which still supplies the prescreener and the fall-back
+		// predictor) and used automatically for the configurations they cover (the larger nns), with
+		// the dense predictor as the fall-back for everything else. The folded file is required only in
+		// this mode; nnedi3_weights.bin above is always required.
+		bool new_weights = in.get_prop<bool>("new_weights", map::default_val(true));
+		if (new_weights) {
+			std::string hvsym_path;
+#ifdef NNEDI3_WEIGHTS_HVSYM_PATH
+			hvsym_path = NNEDI3_WEIGHTS_HVSYM_PATH;
+#else
+			hvsym_path = plugin_dir + "/nnedi3_weights_hvsym.bin";
+#endif
 			if (!znedi3_weights_add_hvsym_from_file(nnedi3_weights.get(), hvsym_path.c_str()))
-				throw std::runtime_error{ "error reading hvsym weights" };
-			use_symmetric = true;
+				throw std::runtime_error{ "error reading hvsym weights from '" + hvsym_path + "'" };
 		}
 
 		m_clip = in.get_prop<FilterNode>("clip");
@@ -192,10 +198,8 @@ public:
 			nnedi3_params.cpu = ZNEDI3_CPU_NONE;
 		if (in.contains("int16_prescreener"))
 			nnedi3_params.int16_prescreen = in.get_prop<bool>("int16_prescreener");
-		if (in.contains("int16_predictor"))
-			nnedi3_params.int16_predict = in.get_prop<bool>("int16_predictor");
-		if (in.contains("silent_fallback"))
-			nnedi3_params.silent_fallback = in.get_prop<bool>("silent_fallback");
+		nnedi3_params.int16_predict = in.get_prop<bool>("int16_predictor", map::default_val(true));
+		nnedi3_params.silent_fallback = in.get_prop<bool>("silent_fallback", map::default_val(true));
 
 		if (in.contains("x_cpu"))
 			override_cpu_type(nnedi3_params.cpu, in.get_prop<std::string>("x_cpu"));
@@ -203,7 +207,7 @@ public:
 		propagate_if_set(nnedi3_params.slow_exp, in.get_prop<int>("exp", map::default_val(-1)));
 		propagate_if_set(nnedi3_params.show_mask, in.get_prop<int>("show_mask", map::default_val(-1)));
 
-		nnedi3_params.symmetric = use_symmetric ? 1 : 0;
+		nnedi3_params.symmetric = new_weights ? 1 : 0;
 
 		char err[256] = { 0 };
 		m_nnedi3.reset(znedi3_filter_create(nnedi3_weights.get(), &nnedi3_params, m_vi.width, m_vi.height / 2, err, sizeof(err)));
@@ -296,8 +300,7 @@ const PluginInfo4 g_plugin_info4{
 			"int16_predictor:int:opt;"
 			"exp:int:opt;"
 			"show_mask:int:opt;"
-			"x_nnedi3_weights_bin:data:opt;"
-			"hvsym:data:opt;"
+			"new_weights:int:opt;"
 			"silent_fallback:int:opt;"
 				"x_cpu:data:opt;",
 			"clip:vnode;"

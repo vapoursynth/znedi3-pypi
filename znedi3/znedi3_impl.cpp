@@ -503,7 +503,7 @@ std::unique_ptr<znedi3_filter::filters> znedi3_filter::setup_filters(const NNEDI
 	if (use_int16 && (type == PixelType::HALF || type == PixelType::FLOAT)) {
 		if (!params.silent_fallback)
 			throw std::runtime_error{ "int16_predictor requested on float input, where it is a precision downgrade; "
-			                          "use integer input, omit int16_predictor, or set silent_fallback=True" };
+			                          "use integer input, set int16_predictor=False, or set silent_fallback=True (the default)" };
 		use_int16 = false;
 	}
 
@@ -518,9 +518,9 @@ std::unique_ptr<znedi3_filter::filters> znedi3_filter::setup_filters(const NNEDI
 		if (it != sym_set.end())
 			predictor = create_symmetric_predictor(*it, params.qual >= ZNEDI3_QUAL_2, cpu, use_int16);
 		if (!predictor && !params.silent_fallback)
-			throw std::runtime_error{ "hvsym weights unavailable for this nsize/nns/etype "
+			throw std::runtime_error{ "the folded (hvsym) predictor does not cover this nsize/nns/etype "
 			                          "(dropped from the file, or below the nns>=128 speed gate); "
-			                          "use a covered config, omit hvsym, or set silent_fallback=True" };
+			                          "use a covered config, or set silent_fallback=True (the default)" };
 	}
 
 	// Dense predictor -- also the fall-back when the symmetric predictor was unavailable + silent_fallback.

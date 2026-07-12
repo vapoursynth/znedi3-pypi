@@ -45,33 +45,38 @@ NS = {0:"8x6",1:"16x6",2:"32x6",3:"48x6",4:"8x4",5:"16x4",6:"32x4"}
 NN = {0:16,1:32,2:64,3:128,4:256}
 ET = {0:"abs",1:"mse"}
 
-# (nsize, nns, etype, qual, expected)   expected: "drop" (byte-identical) or "keep" (tracks)
+# (nsize, nns, etype, qual, expected). "keep" = folds + tracks stock. "error" = strict hvsym must
+# REJECT (dropped from the file, or below the nns>=128 speed gate) -- no silent dense fall-back.
 TESTS = [
-    (4, 4, 1, 1, "keep"),   # mse 8x4  nns256  -- narrowest, best fold
-    (3, 3, 1, 1, "keep"),   # mse 48x6 nns128  -- widest kept
-    (0, 2, 0, 1, "drop"),   # abs 8x6  nns64  -- SPEED-GATED (nns<128) -> dense fallback, byte-identical
-    (6, 4, 0, 1, "keep"),   # abs 32x4 nns256
-    (4, 4, 1, 2, "keep"),   # mse 8x4  nns256 qual2 -- exercises q2 fold
-    (2, 0, 0, 1, "drop"),   # abs 32x6 nns16   -- solidly dropped
-    (5, 4, 0, 1, "drop"),   # abs 16x4 nns256  -- all abs n5 dropped
-    (3, 1, 0, 1, "drop"),   # abs 48x6 nns32   -- dropped
-    (2, 0, 0, 2, "drop"),   # abs 32x6 nns16 qual2 -- dropped, q2 path
+    (4, 4, 1, 1, "keep"),    # mse 8x4  nns256  -- narrowest, best fold
+    (3, 3, 1, 1, "keep"),    # mse 48x6 nns128  -- widest kept
+    (0, 2, 0, 1, "error"),   # abs 8x6  nns64   -- kept but SPEED-GATED (nns<128) -> strict reject
+    (6, 4, 0, 1, "keep"),    # abs 32x4 nns256
+    (4, 4, 1, 2, "keep"),    # mse 8x4  nns256 qual2 -- exercises q2 fold
+    (2, 0, 0, 1, "error"),   # abs 32x6 nns16   -- dropped from file -> strict reject
+    (5, 4, 0, 1, "error"),   # abs 16x4 nns256  -- dropped from file -> strict reject
+    (3, 1, 0, 1, "error"),   # abs 48x6 nns32   -- dropped from file -> strict reject
+    (2, 0, 0, 2, "error"),   # abs 32x6 nns16 qual2 -- dropped, q2 path
 ]
 
-print(f"\n{'config':28} {'exp':5} {'max':>5} {'avg':>7}  verdict")
-print("-"*64)
+print(f"\n{'config':28} {'exp':6} {'maxd':>6}  verdict")
+print("-"*62)
 allok = True
 for ns, nn, et, q, exp in TESTS:
-    a = run(ns, nn, et, qual=q)
-    b = run(ns, nn, et, qual=q, hvsym=HVSYM)
-    mx, av = diff_stats(a, b)
     label = f"{ET[et]} {NS[ns]:>4} nns{NN[nn]:<3} q{q}"
-    if exp == "drop":
-        ok = (mx == 0); verdict = "IDENTICAL (dense fallback)" if ok else "!! DIFFERS - FAIL"
-    else:
-        ok = (mx > 0 and av < 4.0); verdict = "tracks stock" if ok else ("identical?!" if mx==0 else "drifts")
+    if exp == "keep":
+        a = run(ns, nn, et, qual=q); b = run(ns, nn, et, qual=q, hvsym=HVSYM)
+        mx, av = diff_stats(a, b)
+        ok = (mx > 0 and av < 4.0); verdict = "tracks stock" if ok else ("identical?!" if mx == 0 else "drifts")
+        print(f"{label:28} {exp:6} {mx:6d}  {verdict}")
+    else:   # strict: providing hvsym for an uncovered config must raise, not fall back to dense
+        try:
+            run(ns, nn, et, qual=q, hvsym=HVSYM)      # filter creation should raise
+            ok = False; verdict = "!! NO ERROR (silent fallback?)"
+        except vs.Error:
+            ok = True; verdict = "correctly rejected (strict)"
+        print(f"{label:28} {exp:6} {'--':>6}  {verdict}")
     allok &= ok
-    print(f"{label:28} {exp:5} {mx:5d} {av:7.3f}  {verdict}")
 
 # --- cross-check folded paths agree (kept flagship: mse 48x6 nns128) ------------------------
 print("\nfolded-path agreement (mse 48x6 nns128, hvsym) vs each other:")

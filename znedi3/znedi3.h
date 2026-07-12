@@ -113,7 +113,9 @@ typedef struct znedi3_filter znedi3_filter;
 
 void znedi3_filter_params_default(znedi3_filter_params *params);
 
-znedi3_filter *znedi3_filter_create(const znedi3_weights *weights, const znedi3_filter_params *params, unsigned width, unsigned height);
+/* On failure returns NULL; if error is non-NULL, the reason is written there (truncated to
+ * error_size, always NUL-terminated). Pass error=NULL, error_size=0 if the message is not needed. */
+znedi3_filter *znedi3_filter_create(const znedi3_weights *weights, const znedi3_filter_params *params, unsigned width, unsigned height, char *error, size_t error_size);
 
 void znedi3_filter_free(znedi3_filter *ptr);
 

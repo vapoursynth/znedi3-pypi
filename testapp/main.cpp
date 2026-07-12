@@ -239,7 +239,7 @@ int main(int argc, char **argv)
 
 		WindowsBitmap in{ args.input, WindowsBitmap::READ_TAG };
 
-		std::unique_ptr<znedi3_filter, FreeFilter> filter{ znedi3_filter_create(weights.get(), &params, in.width(), in.height() / 2) };
+		std::unique_ptr<znedi3_filter, FreeFilter> filter{ znedi3_filter_create(weights.get(), &params, in.width(), in.height() / 2, nullptr, 0) };
 		if (!filter)
 			throw std::runtime_error{ "error creating filter" };
 

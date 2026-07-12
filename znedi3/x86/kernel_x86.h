@@ -136,6 +136,7 @@ void cubic_interpolation_avx512f(const float * const src[4], float *dst, const u
 std::unique_ptr<Prescreener> create_prescreener_old_avx512f(const PrescreenerOldCoefficients &coeffs, double pixel_half);
 std::unique_ptr<Prescreener> create_prescreener_new_avx512f(const PrescreenerNewCoefficients &coeffs, double pixel_half);
 std::unique_ptr<Predictor> create_predictor_avx512f(const PredictorModel &model, bool use_q2);
+std::unique_ptr<Predictor> create_predictor_int16_avx512vnni(const PredictorModel &model, bool use_q2);
 
 
 pixel_io_func select_pixel_io_func_x86(PixelType in, PixelType out, CPUClass cpu);
@@ -143,7 +144,7 @@ interpolate_func select_interpolate_func_x86(CPUClass cpu);
 
 std::unique_ptr<Prescreener> create_prescreener_old_x86(const PrescreenerOldCoefficients &coeffs, double pixel_half, CPUClass cpu);
 std::unique_ptr<Prescreener> create_prescreener_new_x86(const PrescreenerNewCoefficients &coeffs, double pixel_half, CPUClass cpu);
-std::unique_ptr<Predictor> create_predictor_x86(const PredictorModel &model, bool use_q2, CPUClass cpu);
+std::unique_ptr<Predictor> create_predictor_x86(const PredictorModel &model, bool use_q2, CPUClass cpu, bool use_int16);
 
 } // namespace znedi3
 

@@ -203,14 +203,16 @@ public:
 
 		nnedi3_params.symmetric = use_symmetric ? 1 : 0;
 
-		m_nnedi3.reset(znedi3_filter_create(nnedi3_weights.get(), &nnedi3_params, m_vi.width, m_vi.height / 2));
+		char err[256] = { 0 };
+		m_nnedi3.reset(znedi3_filter_create(nnedi3_weights.get(), &nnedi3_params, m_vi.width, m_vi.height / 2, err, sizeof(err)));
 		if (!m_nnedi3)
-			throw std::runtime_error{ "failed to create nnedi3" };
+			throw std::runtime_error{ err[0] ? err : "failed to create nnedi3" };
 
 		if (m_vi.format.colorFamily == cfYUV) {
-			m_nnedi3_chroma.reset(znedi3_filter_create(nnedi3_weights.get(), &nnedi3_params, m_vi.width >> m_vi.format.subSamplingW, (m_vi.height / 2) >> m_vi.format.subSamplingH));
+			char errc[256] = { 0 };
+			m_nnedi3_chroma.reset(znedi3_filter_create(nnedi3_weights.get(), &nnedi3_params, m_vi.width >> m_vi.format.subSamplingW, (m_vi.height / 2) >> m_vi.format.subSamplingH, errc, sizeof(errc)));
 			if (!m_nnedi3_chroma)
-				throw std::runtime_error{ "failed to create nnedi3" };
+				throw std::runtime_error{ errc[0] ? errc : "failed to create nnedi3" };
 		}
 
 		create_video_filter(out, m_vi, fmParallel, simple_dep(m_clip, rpStrictSpatial), core);

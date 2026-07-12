@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <cstdio>
+#include <exception>
 #include <limits>
 #include <memory>
 #include "weights.h"
@@ -129,12 +130,26 @@ void znedi3_filter_params_default(znedi3_filter_params *params)
 	params->symmetric = 0;
 }
 
-znedi3_filter *znedi3_filter_create(const znedi3_weights *weights, const znedi3_filter_params *params, unsigned width, unsigned height) try
+namespace {
+void copy_error(char *error, size_t error_size, const char *msg)
+{
+	if (error && error_size)
+		std::snprintf(error, error_size, "%s", msg);
+}
+} // namespace
+
+// On failure returns nullptr and, if error != nullptr, copies the reason (truncated to error_size,
+// always null-terminated) so the caller can surface it instead of a generic message.
+znedi3_filter *znedi3_filter_create(const znedi3_weights *weights, const znedi3_filter_params *params, unsigned width, unsigned height, char *error, size_t error_size) try
 {
 	const znedi3::NNEDI3Weights *nnedi3 = static_cast<const znedi3::NNEDI3Weights *>(weights);
 	std::unique_ptr<znedi3::znedi3_filter> filter = std::make_unique<znedi3::znedi3_filter>(*nnedi3, *params, width, height);
 	return filter.release();
+} catch (const std::exception &e) {
+	copy_error(error, error_size, e.what());
+	return nullptr;
 } catch (...) {
+	copy_error(error, error_size, "unknown error creating nnedi3 filter");
 	return nullptr;
 }
 

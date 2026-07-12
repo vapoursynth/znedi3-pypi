@@ -1246,6 +1246,180 @@ public:
 	}
 };
 
+// int16 VNNI predictor: identical math to PredictorAVX512F, but the mat-vec runs in int16 via
+// vpdpwssd. The interleaved weights are mean-folded, so every filter row sums to zero; therefore
+// subtracting the window mean before quantising is exact, and normalising (x-mean)*inv_std into
+// int16 (scale S) keeps the int32 accumulator bounded by S*S*|dot| < 4096*4096*~90 < 2^31 -- no
+// overflow, no flush. ~12-bit matvec, validated 16-bit-clean (sub-cv on flat detail, edge error far
+// below the prediction's own error). Selected for WORD input on VNNI CPUs; ~2x the fp32 matvec.
+class PredictorInt16VNNIAVX512 final : public Predictor {
+	// The interleaved weights are mean-folded (every filter row sums to zero), so subtracting the
+	// window mean before quantising is exact. But the real weights span a huge dynamic range (elliott
+	// rows reach ~1167 while softmax rows are ~17), so a single scale would clip catastrophically.
+	// Hence a PER-ROW weight scale (each row's max maps to WCAP) and a PER-WINDOW dynamic scale (the
+	// normalised window's max maps to XCAP). WCAP*XCAP*max_filter_size < 2^31 guarantees the int32
+	// vpdpwssd accumulator never overflows a full dot (288*4096*1024 = 1.2e9). ~12-bit weights /
+	// ~10-bit window; the fp32 mean/std and reconstruction keep the 16-bit magnitude exact.
+	static constexpr float WCAP = 8192.0f;
+	static constexpr float XCAP = 768.0f;    // WCAP*XCAP*288 = 1.8e9 < 2^31: full int32 dot never overflows
+
+	InterleavedPredictorModel m_model;
+	AlignedVector<uint32_t> m_qn_q1, m_qn_q2;      // int16 weights, column-pairs packed: [fs/2][2*nns]
+	AlignedVector<float> m_invSW_q1, m_invSW_q2;   // per-row 1/scale [2*nns]
+	double m_inv_filter_size;
+	bool m_use_q2;
+
+	static void quantize(const float *neurons, AlignedVector<uint32_t> &out, AlignedVector<float> &invSW, unsigned fs, unsigned rows)
+	{
+		unsigned P = fs / 2;
+		invSW.resize(rows);
+		std::vector<float> SW(rows);
+		for (unsigned i = 0; i < rows; ++i) {
+			float mx = 1e-9f;
+			for (unsigned k = 0; k < fs; ++k) mx = std::max(mx, std::fabs(neurons[static_cast<size_t>(k) * rows + i]));
+			SW[i] = WCAP / mx;
+			invSW[i] = 1.0f / SW[i];
+		}
+		out.resize(static_cast<size_t>(P) * rows);
+		for (unsigned pr = 0; pr < P; ++pr)
+			for (unsigned i = 0; i < rows; ++i) {
+				auto q = [&](unsigned k) -> uint16_t {
+					int v = static_cast<int>(std::lrintf(neurons[static_cast<size_t>(k) * rows + i] * SW[i]));
+					return static_cast<uint16_t>(static_cast<int16_t>(v > 32767 ? 32767 : (v < -32768 ? -32768 : v)));
+				};
+				out[static_cast<size_t>(pr) * rows + i] = q(2 * pr) | (static_cast<uint32_t>(q(2 * pr + 1)) << 16);
+			}
+	}
+
+	// normalise (x-mean)*inv_std, dynamic-scale so max|.| maps to XCAP, saturate to int16 pairs. returns 1/scale.
+	static float quantize_window(const float *w, float mean, float inv, uint32_t *out, unsigned fs)
+	{
+		const __m512i absmask = _mm512_set1_epi32(0x7FFFFFFF);
+		__m512 vm = _mm512_set1_ps(mean), vi = _mm512_set1_ps(inv), vmax = _mm512_setzero_ps();
+		for (unsigned j = 0; j < fs; j += 16) {
+			__m512 xn = _mm512_mul_ps(_mm512_sub_ps(_mm512_loadu_ps(w + j), vm), vi);
+			vmax = _mm512_max_ps(vmax, _mm512_castsi512_ps(_mm512_and_si512(_mm512_castps_si512(xn), absmask)));
+		}
+		float mx = _mm512_reduce_max_ps(vmax);
+		if (mx < 1e-9f) mx = 1e-9f;
+		float SX = XCAP / mx;
+		__m512 vs = _mm512_set1_ps(inv * SX);
+		for (unsigned j = 0; j < fs; j += 16) {
+			__m512 xn = _mm512_mul_ps(_mm512_sub_ps(_mm512_loadu_ps(w + j), vm), vs);
+			_mm256_storeu_si256(reinterpret_cast<__m256i *>(out + j / 2), _mm512_cvtsepi32_epi16(_mm512_cvtps_epi32(xn)));
+		}
+		return 1.0f / SX;
+	}
+
+	// int16 mat-vec (vpdpwssd), 4 pixels: activation = (int32 dot) * invSW[row] * invSX[px] + bias
+	void sgemv(const uint32_t *M, const uint32_t *const V[4], const float *invSW, const float invSX[4], const float *bias, unsigned rows, unsigned P, float *result, unsigned nns) const
+	{
+		float *as = result, *ae = result + 4 * static_cast<ptrdiff_t>(nns);
+		for (unsigned i = 0; i < rows; i += 32) {
+			__m512i a[2][4];
+			for (int s = 0; s < 2; ++s) for (int p = 0; p < 4; ++p) a[s][p] = _mm512_setzero_si512();
+			for (unsigned pr = 0; pr < P; ++pr) {
+				__m512i vp[4];
+				for (int p = 0; p < 4; ++p) vp[p] = _mm512_set1_epi32(static_cast<int>(V[p][pr]));
+				for (int s = 0; s < 2; ++s) {
+					__m512i w = _mm512_loadu_si512(reinterpret_cast<const void *>(M + static_cast<size_t>(pr) * rows + i + s * 16));
+					for (int p = 0; p < 4; ++p) a[s][p] = _mm512_dpwssd_epi32(a[s][p], w, vp[p]);
+				}
+			}
+			for (int s = 0; s < 2; ++s) {
+				__m512 isw = _mm512_load_ps(invSW + i + s * 16);
+				__m512 bs = _mm512_load_ps(bias + i + s * 16);
+				for (int p = 0; p < 4; ++p) {
+					__m512 t = _mm512_mul_ps(_mm512_cvtepi32_ps(a[s][p]), isw);
+					__m512 v = _mm512_fmadd_ps(t, _mm512_set1_ps(invSX[p]), bs);
+					unsigned idx = i + s * 16;
+					float *dst = idx >= nns ? ae + (idx - nns) : as + idx;
+					_mm512_store_ps(dst + static_cast<size_t>(p) * nns, v);
+				}
+			}
+		}
+	}
+
+	void apply_model(const float *input, float *activation, float *mstd, const __m512d *partial_sum_sumsq) const
+	{
+		unsigned fs = m_model.xdim * m_model.ydim, nns = m_model.nns, P = fs / 2, rows = 2 * nns;
+		float *activation_softmax = activation, *activation_elliott = activation + 4 * nns;
+		input_stddev_x4(partial_sum_sumsq, mstd, m_inv_filter_size);
+
+		alignas(64) uint32_t qwin[4 * (48 * 6 / 2)];
+		float invSX[4];
+		for (int p = 0; p < 4; ++p)
+			invSX[p] = quantize_window(input + static_cast<size_t>(p) * fs, mstd[p], mstd[8 + p], qwin + static_cast<size_t>(p) * P, fs);
+		const uint32_t *V[4] = { qwin, qwin + P, qwin + 2 * P, qwin + 3 * P };
+
+		for (unsigned q = 0; q < (m_use_q2 ? 2U : 1U); ++q) {
+			sgemv(q ? m_qn_q2.data() : m_qn_q1.data(), V, q ? m_invSW_q2.data() : m_invSW_q1.data(),
+			      invSX, q ? m_model.bias_q2 : m_model.bias_q1, rows, P, activation, nns);
+			softmax_exp(activation_softmax, 4 * nns);
+			wae5_x4(activation_softmax, activation_elliott, nns, mstd);
+		}
+	}
+public:
+	PredictorInt16VNNIAVX512(const PredictorModel &model, bool use_q2) :
+		m_model(create_interleaved_predictor_model(model)),
+		m_inv_filter_size{ 1.0 / (m_model.xdim * m_model.ydim) },
+		m_use_q2{ use_q2 }
+	{
+		assert(model.first.xdim * model.first.ydim <= 48 * 6);
+		unsigned rows = 2 * m_model.nns, fs = m_model.xdim * m_model.ydim;
+		quantize(m_model.neurons_q1, m_qn_q1, m_invSW_q1, fs, rows);
+		if (use_q2)
+			quantize(m_model.neurons_q2, m_qn_q2, m_invSW_q2, fs, rows);
+	}
+
+	size_t get_tmp_size() const noexcept override
+	{
+		FakeAllocator alloc;
+		alloc.allocate_n<float>(48 * 6 * 4);
+		alloc.allocate_n<float>(256 * 2 * 4);
+		alloc.allocate_n<float>(4 * 4);
+		return alloc.count();
+	}
+
+	void process(const float * const src[6], float *dst, const unsigned char *prescreen, void *tmp, unsigned n) const noexcept override
+	{
+		LinearAllocator alloc{ tmp };
+
+		ptrdiff_t window_offset_y = 3 - (m_model.ydim / 2);
+		ptrdiff_t window_offset_x = static_cast<size_t>(m_model.xdim) / 2 - 1;
+		size_t filter_size = static_cast<size_t>(m_model.xdim) * m_model.ydim;
+
+		float *input = alloc.allocate_n<float>(48 * 6 * 4);
+		float *activation = alloc.allocate_n<float>(256 * 2 * 4);
+		float *mstd = alloc.allocate_n<float>(4 * 4);
+
+		__m512d partial_sum_sumsq[8];
+		unsigned gathered_idx[4];
+		size_t num_gathered = 0;
+
+		for (ptrdiff_t i = 0; i < static_cast<ptrdiff_t>(n); ++i) {
+			if (prescreen[i])
+				continue;
+
+			gather_pixels_avx512(src + window_offset_y, i - window_offset_x, m_model.xdim, m_model.ydim, input + num_gathered * filter_size, partial_sum_sumsq + num_gathered * 2);
+			gathered_idx[num_gathered] = static_cast<unsigned>(i);
+			++num_gathered;
+
+			if (num_gathered == 4) {
+				apply_model(input, activation, mstd, partial_sum_sumsq);
+				for (ptrdiff_t idx = 0; idx < 4; ++idx)
+					dst[gathered_idx[idx]] = mstd[3 * 4 + idx] * (m_use_q2 ? 0.5f : 1.0f);
+				num_gathered = 0;
+			}
+		}
+		if (num_gathered) {
+			apply_model(input, activation, mstd, partial_sum_sumsq);
+			for (ptrdiff_t idx = 0; idx < static_cast<ptrdiff_t>(num_gathered); ++idx)
+				dst[gathered_idx[idx]] = mstd[3 * 4 + idx] * (m_use_q2 ? 0.5f : 1.0f);
+		}
+	}
+};
+
 } // namespace
 
 
@@ -1406,6 +1580,11 @@ std::unique_ptr<Predictor> create_predictor_avx512f(const PredictorModel &model,
 std::unique_ptr<Predictor> create_symmetric_predictor_avx512f(const SymmetricPredictorModel &model, bool use_q2)
 {
 	return std::make_unique<PredictorSymmetricAVX512F>(model, use_q2);
+}
+
+std::unique_ptr<Predictor> create_predictor_int16_avx512vnni(const PredictorModel &model, bool use_q2)
+{
+	return std::make_unique<PredictorInt16VNNIAVX512>(model, use_q2);
 }
 
 } // namespace znedi3

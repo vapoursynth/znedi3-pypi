@@ -363,13 +363,16 @@ std::unique_ptr<Prescreener> create_prescreener_new_x86(const PrescreenerNewCoef
 	return ret;
 }
 
-std::unique_ptr<Predictor> create_predictor_x86(const PredictorModel &model, bool use_q2, CPUClass cpu)
+std::unique_ptr<Predictor> create_predictor_x86(const PredictorModel &model, bool use_q2, CPUClass cpu, bool use_int16)
 {
 	X86Capabilities caps = query_x86_capabilities();
 	std::unique_ptr<Predictor> ret;
 
 	if (cpu_is_autodetect(cpu)) {
 #ifdef ZNEDI3_X86_AVX512
+		// int16-VNNI mat-vec (~2x fp32, precision-safe for high bit depth) when requested + available.
+		if (!ret && use_int16 && cpu == CPUClass::AUTO_64B && caps.avx512f && caps.avx512vnni)
+			ret = create_predictor_int16_avx512vnni(model, use_q2);
 		if (!ret && cpu == CPUClass::AUTO_64B && caps.avx512f)
 			ret = create_predictor_avx512f(model, use_q2);
 #endif
@@ -382,6 +385,7 @@ std::unique_ptr<Predictor> create_predictor_x86(const PredictorModel &model, boo
 		if (!ret && caps.sse)
 			ret = create_predictor_sse(model, use_q2);
 	} else {
+		// Explicit cpu override always uses the pure fp32 kernel for that ISA (no int16-VNNI).
 #ifdef ZNEDI3_X86_AVX512
 		if (!ret && cpu >= CPUClass::X86_AVX512)
 			ret = create_predictor_avx512f(model, use_q2);

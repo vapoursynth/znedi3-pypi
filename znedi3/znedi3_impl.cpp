@@ -497,14 +497,24 @@ std::unique_ptr<znedi3_filter::filters> znedi3_filter::setup_filters(const NNEDI
 	assert(model_set.find(traits) != model_set.end());
 
 	std::unique_ptr<Predictor> predictor;
-	if (params.symmetric && weights.has_symmetric()) {
+	if (params.symmetric) {
+		// The hvsym (symmetric) weights were explicitly requested: use them or fail. Do NOT silently
+		// substitute the dense model -- an uncovered config (dropped during training, or below the
+		// nns>=128 speed gate) is an error, not a fall-back to the old model.
 		const SymmetricPredictorModelSet &sym_set = (params.etype == ZNEDI3_ETYPE_MSE) ? weights.sym_mse_models() : weights.sym_abs_models();
 		auto it = sym_set.find(traits);
 		if (it != sym_set.end())
 			predictor = create_symmetric_predictor(*it, params.qual >= ZNEDI3_QUAL_2, cpu);
+		if (!predictor)
+			throw std::runtime_error{ "hvsym weights requested but unavailable for this nsize/nns/etype "
+			                          "(dropped from the file, or below the nns>=128 speed gate); "
+			                          "use a covered config or omit the hvsym argument" };
+	} else {
+		// int16-VNNI mat-vec is gated behind the int16_predictor argument (opt-in). The dispatch is
+		// VNNI-gated and falls back to fp32 automatically when the CPU lacks AVX-512 VNNI.
+		bool use_int16 = params.int16_predict != 0;
+		predictor = create_predictor(*model_set.find(traits), params.qual >= ZNEDI3_QUAL_2, cpu, use_int16);
 	}
-	if (!predictor)
-		predictor = create_predictor(*model_set.find(traits), params.qual >= ZNEDI3_QUAL_2, cpu);
 
 	interpolate_func interpolate = nullptr;
 	if (params.show_mask >= 2)

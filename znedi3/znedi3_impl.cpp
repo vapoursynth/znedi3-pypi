@@ -497,22 +497,31 @@ std::unique_ptr<znedi3_filter::filters> znedi3_filter::setup_filters(const NNEDI
 	assert(model_set.find(traits) != model_set.end());
 
 	std::unique_ptr<Predictor> predictor;
+
+	// hvsym (h+v-symmetric) predictor, if requested. A config the file/gate does not cover is an error
+	// unless silent_fallback lets us drop to the dense model instead.
 	if (params.symmetric) {
-		// The hvsym (symmetric) weights were explicitly requested: use them or fail. Do NOT silently
-		// substitute the dense model -- an uncovered config (dropped during training, or below the
-		// nns>=128 speed gate) is an error, not a fall-back to the old model.
 		const SymmetricPredictorModelSet &sym_set = (params.etype == ZNEDI3_ETYPE_MSE) ? weights.sym_mse_models() : weights.sym_abs_models();
 		auto it = sym_set.find(traits);
 		if (it != sym_set.end())
 			predictor = create_symmetric_predictor(*it, params.qual >= ZNEDI3_QUAL_2, cpu);
-		if (!predictor)
-			throw std::runtime_error{ "hvsym weights requested but unavailable for this nsize/nns/etype "
+		if (!predictor && !params.silent_fallback)
+			throw std::runtime_error{ "hvsym weights unavailable for this nsize/nns/etype "
 			                          "(dropped from the file, or below the nns>=128 speed gate); "
-			                          "use a covered config or omit the hvsym argument" };
-	} else {
-		// int16-VNNI mat-vec is gated behind the int16_predictor argument (opt-in). The dispatch is
-		// VNNI-gated and falls back to fp32 automatically when the CPU lacks AVX-512 VNNI.
+			                          "use a covered config, omit hvsym, or set silent_fallback=True" };
+	}
+
+	// Dense predictor -- also the fall-back when the symmetric predictor was unavailable + silent_fallback.
+	if (!predictor) {
+		// int16-VNNI mat-vec, opt-in via int16_predictor (VNNI-gated; auto fp32 fallback on non-VNNI CPUs).
+		// On float/half input it is a precision downgrade, so it errors there unless silent_fallback keeps fp32.
 		bool use_int16 = params.int16_predict != 0;
+		if (use_int16 && (type == PixelType::HALF || type == PixelType::FLOAT)) {
+			if (!params.silent_fallback)
+				throw std::runtime_error{ "int16_predictor requested on float input, where it is a precision downgrade; "
+				                          "use integer input, omit int16_predictor, or set silent_fallback=True" };
+			use_int16 = false;
+		}
 		predictor = create_predictor(*model_set.find(traits), params.qual >= ZNEDI3_QUAL_2, cpu, use_int16);
 	}
 

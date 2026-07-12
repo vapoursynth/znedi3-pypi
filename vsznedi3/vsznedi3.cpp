@@ -194,6 +194,8 @@ public:
 			nnedi3_params.int16_prescreen = in.get_prop<bool>("int16_prescreener");
 		if (in.contains("int16_predictor"))
 			nnedi3_params.int16_predict = in.get_prop<bool>("int16_predictor");
+		if (in.contains("silent_fallback"))
+			nnedi3_params.silent_fallback = in.get_prop<bool>("silent_fallback");
 
 		if (in.contains("x_cpu"))
 			override_cpu_type(nnedi3_params.cpu, in.get_prop<std::string>("x_cpu"));
@@ -296,6 +298,7 @@ const PluginInfo4 g_plugin_info4{
 			"show_mask:int:opt;"
 			"x_nnedi3_weights_bin:data:opt;"
 			"hvsym:data:opt;"
+			"silent_fallback:int:opt;"
 				"x_cpu:data:opt;",
 			"clip:vnode;"
 		}

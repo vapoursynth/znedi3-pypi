@@ -106,7 +106,9 @@ typedef struct znedi3_filter_params {
 	unsigned char int16_predict;
 	unsigned char slow_exp;
 	unsigned char show_mask;
-	unsigned char symmetric;   /**< Use the h+v-symmetric predictor (requires znedi3_weights_add_hvsym). */
+	unsigned char symmetric;         /**< Use the h+v-symmetric predictor (requires znedi3_weights_add_hvsym). */
+	unsigned char silent_fallback;   /**< If nonzero, fall back to the dense/fp32 model instead of erroring when
+	                                      the requested symmetric or int16 path is unavailable for this config/input. */
 } znedi3_filter_params;
 
 typedef struct znedi3_filter znedi3_filter;

@@ -128,6 +128,7 @@ void znedi3_filter_params_default(znedi3_filter_params *params)
 	params->slow_exp = 0;
 	params->show_mask = 0;
 	params->symmetric = 0;
+	params->silent_fallback = 0;
 }
 
 namespace {

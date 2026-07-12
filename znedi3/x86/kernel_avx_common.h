@@ -17,6 +17,7 @@
 
 #include <cassert>
 #include <cfloat>
+#include <cmath>
 #include <cstddef>
 #include "alloc.h"
 #include "ccdep.h"

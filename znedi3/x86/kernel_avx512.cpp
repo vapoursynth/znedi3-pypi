@@ -1309,8 +1309,11 @@ public:
 		for (ptrdiff_t i = 0; i < (ptrdiff_t)n; ++i) {
 			if (prescreen[i]) continue;
 			gather(i);
-			if (num == 4) { apply4(buf, xhc, act, mstd, sum, sumsq);
-				for (int p = 0; p < 4; ++p) dst[gathered_idx[p]] = mstd[12 + p] * (m_use_q2 ? 0.5f : 1.0f); num = 0; }
+			if (num == 4) {
+				apply4(buf, xhc, act, mstd, sum, sumsq);
+				for (int p = 0; p < 4; ++p) dst[gathered_idx[p]] = mstd[12 + p] * (m_use_q2 ? 0.5f : 1.0f);
+				num = 0;
+			}
 		}
 		if (num) { apply4(buf, xhc, act, mstd, sum, sumsq);
 			for (unsigned p = 0; p < num; ++p) dst[gathered_idx[p]] = mstd[12 + p] * (m_use_q2 ? 0.5f : 1.0f); }

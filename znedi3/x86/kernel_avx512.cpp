@@ -1128,18 +1128,20 @@ class PredictorInt16VNNIAVX512 final : public Predictor {
 	// window mean before quantising is exact. But the real weights span a huge dynamic range (elliott
 	// rows reach ~1167 while softmax rows are ~17), so a single scale would clip catastrophically.
 	// Hence a PER-ROW weight scale (each row's max maps to WCAP) and a PER-WINDOW dynamic scale (the
-	// normalised window's max maps to XCAP).
+	// normalised window's max maps to XCAP). The int32 accumulator uses the SATURATING dot (vpdpwssds)
+	// as a safety net for the rare genuine overflow (a clipped activation still reads as a dominant
+	// expert, so softmax ranking is preserved).
 	//
-	// The int32 accumulator uses the SATURATING dot (vpdpwssds). This deliberately lets the caps sit
-	// above the strict worst-case bound WCAP*XCAP*max_filter_size (~1.8e10 >> 2^31 at 48x6): the ~13-bit
-	// weight / ~11.5-bit window precision this buys shrinks the per-activation quantisation noise (and
-	// with it the rare softmax-boundary flips that drive the q2 error tail) far more than the rare
-	// genuine overflow costs -- and that overflow saturates rather than wrapping, so a clipped activation
-	// still reads as a strongly-dominant expert and softmax ranking is preserved. Vs the old non-saturating
-	// conservative caps (8192/768) this cuts the 48x6/nns256 q2 tail ~6x (99.9%ile ~540 -> ~80 cv @16-bit)
-	// while improving every other config; the fp32 mean/std and reconstruction keep the 16-bit magnitude exact.
-	static constexpr float WCAP = 20480.0f;   // per-row weight cap (< 2^15 so quantised weights stay int16)
-	static constexpr float XCAP = 3072.0f;    // per-window cap; saturating accumulator absorbs rare overflow
+	// XCAP is set PER WINDOW SIZE (constructor), not fixed: the accumulator magnitude grows ~sqrt(fs),
+	// so a small window (few taps) can map its window to a much finer scale before the dot saturates,
+	// while a large window must stay coarse. XCAP = clamp(56000/sqrt(fs), XCAP_MIN, XCAP_MAX) sits below
+	// the measured saturation cliff for every window (cliff ~ 1/sqrt(fs)) with margin, and makes the
+	// small/mid windows ~2-3x closer to the fp32 predictor than a single 48x6-tuned cap did. WCAP is a
+	// per-row scale (accumulation-length independent) so it stays fixed. The fp32 mean/std and
+	// reconstruction keep the 16-bit magnitude exact.
+	static constexpr float WCAP = 28672.0f;   // per-row weight cap (< 2^15 so quantised weights stay int16)
+	static constexpr float XCAP_MIN = 3072.0f, XCAP_MAX = 9216.0f;
+	float m_xcap;                             // per-window cap, from filter size (see constructor)
 
 	InterleavedPredictorModel m_model;
 	AlignedVector<uint32_t> m_qn_q1, m_qn_q2;      // int16 weights, column-pairs packed: [fs/2][2*nns]
@@ -1169,8 +1171,8 @@ class PredictorInt16VNNIAVX512 final : public Predictor {
 			}
 	}
 
-	// normalise (x-mean)*inv_std, dynamic-scale so max|.| maps to XCAP, saturate to int16 pairs. returns 1/scale.
-	static float quantize_window(const float *w, float mean, float inv, uint32_t *out, unsigned fs)
+	// normalise (x-mean)*inv_std, dynamic-scale so max|.| maps to xcap, saturate to int16 pairs. returns 1/scale.
+	static float quantize_window(const float *w, float mean, float inv, uint32_t *out, unsigned fs, float xcap)
 	{
 		const __m512i absmask = _mm512_set1_epi32(0x7FFFFFFF);
 		__m512 vm = _mm512_set1_ps(mean), vi = _mm512_set1_ps(inv), vmax = _mm512_setzero_ps();
@@ -1180,7 +1182,7 @@ class PredictorInt16VNNIAVX512 final : public Predictor {
 		}
 		float mx = _mm512_reduce_max_ps(vmax);
 		if (mx < 1e-9f) mx = 1e-9f;
-		float SX = XCAP / mx;
+		float SX = xcap / mx;
 		__m512 vs = _mm512_set1_ps(inv * SX);
 		for (unsigned j = 0; j < fs; j += 16) {
 			__m512 xn = _mm512_mul_ps(_mm512_sub_ps(_mm512_loadu_ps(w + j), vm), vs);
@@ -1204,7 +1206,7 @@ class PredictorInt16VNNIAVX512 final : public Predictor {
 				for (int p = 0; p < 8; ++p) vp[p] = _mm512_set1_epi32(static_cast<int>(V[p][pr]));
 				for (int s = 0; s < 2; ++s) {
 					__m512i w = _mm512_loadu_si512(reinterpret_cast<const void *>(M + static_cast<size_t>(pr) * rows + i + s * 16));
-					for (int p = 0; p < 8; ++p) a[s][p] = _mm512_dpwssds_epi32(a[s][p], w, vp[p]);   // saturating: see caps note
+					for (int p = 0; p < 8; ++p) a[s][p] = _mm512_dpwssds_epi32(a[s][p], w, vp[p]);   // saturating safety net
 				}
 			}
 			for (int s = 0; s < 2; ++s) {
@@ -1233,7 +1235,7 @@ class PredictorInt16VNNIAVX512 final : public Predictor {
 		float invSX[8];
 		for (int p = 0; p < 8; ++p) {
 			const float *mp = (p < 4) ? mstd : mstd + 16;
-			invSX[p] = quantize_window(input + static_cast<size_t>(p) * fs, mp[p & 3], mp[8 + (p & 3)], qwin + static_cast<size_t>(p) * P, fs);
+			invSX[p] = quantize_window(input + static_cast<size_t>(p) * fs, mp[p & 3], mp[8 + (p & 3)], qwin + static_cast<size_t>(p) * P, fs, m_xcap);
 		}
 		const uint32_t *V[8] = { qwin, qwin + P, qwin + 2 * P, qwin + 3 * P, qwin + 4 * P, qwin + 5 * P, qwin + 6 * P, qwin + 7 * P };
 
@@ -1253,6 +1255,8 @@ public:
 	{
 		assert(model.first.xdim * model.first.ydim <= 48 * 6);
 		unsigned rows = 2 * m_model.nns, fs = m_model.xdim * m_model.ydim;
+		// per-window scale: finer for small windows (accumulator ~sqrt(fs)), coarser for large; below the cliff.
+		m_xcap = std::min(XCAP_MAX, std::max(XCAP_MIN, 56000.0f / std::sqrt(static_cast<float>(fs))));
 		quantize(m_model.neurons_q1, m_qn_q1, m_invSW_q1, fs, rows);
 		if (use_q2)
 			quantize(m_model.neurons_q2, m_qn_q2, m_invSW_q2, fs, rows);

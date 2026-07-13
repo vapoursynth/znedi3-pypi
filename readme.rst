@@ -157,30 +157,36 @@ Parameters:
         Default: True.
 
     *int16_prescreener*
-        If True, the prescreener will perform the dot product
-        calculations using 16 bit integers. Otherwise, it will use
-        single precision floats.
+        No effect in this build. The prescreener always performs its dot
+        product calculations in single precision float; there is no 16 bit
+        integer prescreener implementation. The parameter is still accepted
+        (and ignored) for backward compatibility.
 
-        This parameter is ignored when the input has float samples.
-
-        Default: True.
+        Default: True (ignored).
 
     *int16_predictor*
-        If True, the predictor will perform the dot product
-        calculations using 16 bit integers. Otherwise, it will use
-        single precision floats.
+        If True, the predictor performs its matrix-vector dot products
+        using 16 bit integers (via AVX-512 VNNI) instead of single
+        precision floats, roughly doubling predictor throughput on
+        integer input. The neighbourhood window is mean/standard-deviation
+        normalised before it is quantised, so the result stays close to
+        the float predictor (the error is far below the prediction's own
+        error) regardless of the input bit depth.
 
-        This parameter is ignored when the input has more than 15 bits
-        per sample.
+        This parameter is silently ignored -- the float predictor is used
+        instead -- for half and single precision float input (where 16 bit
+        integers would be a precision downgrade), and on CPUs without
+        AVX-512 VNNI.
 
         Default: True.
 
     *exp*
-        The exp function approximation to use in the predictor. 0 is
-        the fastest and least accurate. 2 is the slowest and most
-        accurate.
+        No effect in this build. The predictor always uses a single
+        vectorised polynomial approximation of exp in its softmax; there
+        is no selectable slow/accurate variant. The parameter is still
+        accepted (and ignored) for backward compatibility.
 
-        Default: 0.
+        Default: 0 (ignored).
 
     *show_mask*
         If True, the pixels that would be processed with the predictor

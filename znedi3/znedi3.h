@@ -94,9 +94,9 @@ typedef struct znedi3_filter_params {
 	znedi3_etype_e etype;
 	znedi3_prescreen_e prescreen;
 	znedi3_cpu_type_e cpu;
-	unsigned char int16_prescreen;
+	unsigned char int16_prescreen; /* no-op: retained for compatibility; no int16 prescreener exists */
 	unsigned char int16_predict;
-	unsigned char slow_exp;
+	unsigned char slow_exp;        /* no-op: retained for compatibility; exp is always the vectorised polynomial */
 	unsigned char show_mask;
 } znedi3_filter_params;
 

@@ -85,9 +85,9 @@ void znedi3_filter_params_default(znedi3_filter_params *params)
 	params->etype = ZNEDI3_ETYPE_ABS;
 	params->prescreen = ZNEDI3_PRESCREEN_NEW_L0;
 	params->cpu = ZNEDI3_CPU_AUTO;
-	params->int16_predict = 0;
-	params->int16_prescreen = 0;
-	params->slow_exp = 0;
+	params->int16_predict = 1;   // int16-VNNI predictor on by default; auto-falls back to fp32 on float/half input or non-VNNI CPUs
+	params->int16_prescreen = 1; // no-op: no int16 prescreener implementation exists; field retained for API compatibility
+	params->slow_exp = 0;        // no-op: predictor always uses the vectorised polynomial exp; field retained for API compatibility
 	params->show_mask = 0;
 }
 

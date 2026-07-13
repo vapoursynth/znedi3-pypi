@@ -357,12 +357,12 @@ std::unique_ptr<Prescreener> create_prescreener_new(const PrescreenerNewCoeffici
 	return ret;
 }
 
-std::unique_ptr<Predictor> create_predictor(const std::pair<const PredictorTraits, PredictorCoefficients> &model, bool use_q2, CPUClass cpu)
+std::unique_ptr<Predictor> create_predictor(const std::pair<const PredictorTraits, PredictorCoefficients> &model, bool use_q2, CPUClass cpu, bool use_int16)
 {
 	std::unique_ptr<Predictor> ret;
 
 #ifdef ZNEDI3_X86
-	ret = create_predictor_x86(model, use_q2, cpu);
+	ret = create_predictor_x86(model, use_q2, cpu, use_int16);
 #endif
 
 	if (!ret)

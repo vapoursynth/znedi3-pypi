@@ -495,7 +495,13 @@ std::unique_ptr<znedi3_filter::filters> znedi3_filter::setup_filters(const NNEDI
 	PredictorTraits traits{ NNEDI3_XDIM[params.nsize], NNEDI3_YDIM[params.nsize], NNEDI3_NNS[params.nns] };
 	const PredictorModelSet &model_set = (params.etype == ZNEDI3_ETYPE_MSE) ? weights.mse_models() : weights.abs_models();
 	assert(model_set.find(traits) != model_set.end());
-	std::unique_ptr<Predictor> predictor = create_predictor(*model_set.find(traits), params.qual >= ZNEDI3_QUAL_2, cpu);
+
+	// int16-VNNI mat-vec is opt-in via the int16_predictor argument. It applies only to 8-16 bit
+	// integer input; on half/float input it is a precision downgrade, so we silently fall back to the
+	// fp32 kernel there. The dispatch is also VNNI-gated and falls back to fp32 automatically when the
+	// CPU lacks AVX-512 VNNI (or cpu is overridden).
+	bool use_int16 = params.int16_predict != 0 && type != PixelType::HALF && type != PixelType::FLOAT;
+	std::unique_ptr<Predictor> predictor = create_predictor(*model_set.find(traits), params.qual >= ZNEDI3_QUAL_2, cpu, use_int16);
 
 	interpolate_func interpolate = nullptr;
 	if (params.show_mask >= 2)

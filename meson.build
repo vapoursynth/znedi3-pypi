@@ -130,7 +130,7 @@ if host_machine.cpu_family() in ['x86', 'x86_64']
     
     libs += static_library('kernel_avx512', 'znedi3/x86/kernel_avx512.cpp',
         include_directories: incdir,
-        cpp_args: ['-mavx512f', '-mfma', '-mtune=skylake-avx512']
+        cpp_args: ['-mavx512f', '-mavx512vnni', '-mfma', '-mtune=skylake-avx512']
     )
 endif
 

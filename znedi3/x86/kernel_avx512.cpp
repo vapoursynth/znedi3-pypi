@@ -997,30 +997,62 @@ inline FORCE_INLINE void wae5_x4(const float *softmax, const float *elliott, uns
 	_mm_store_ps(mstd + 3 * 4, mstd3);
 }
 
+// fp32 mat-vec, 8 pixels/group (Step-32 row block, a[2][8] = 16 accumulators). Same math as the
+// hand-unrolled sgemv_x4; grouping 8 pixels reuses each streamed weight row across twice as many
+// pixels (the large-window bottleneck is weight bandwidth, and fp32 weights are 2x int16's bytes).
+inline FORCE_INLINE void sgemv_x8_avx512(const float *matrix, const float *vector, const float *bias, unsigned matrix_rows, unsigned matrix_cols,
+                                         float *result, unsigned nns, const float *scale)
+{
+	float *as = result, *ae = result + 8 * static_cast<ptrdiff_t>(nns);
+	for (ptrdiff_t i = 0; i < static_cast<ptrdiff_t>(matrix_rows); i += 32) {
+		__m512 a[2][8];
+		for (int s = 0; s < 2; ++s) for (int p = 0; p < 8; ++p) a[s][p] = _mm512_setzero_ps();
+		for (ptrdiff_t j = 0; j < static_cast<ptrdiff_t>(matrix_cols); ++j) {
+			__m512 x[8];
+			for (int p = 0; p < 8; ++p) x[p] = _mm512_set1_ps(vector[static_cast<ptrdiff_t>(p) * matrix_cols + j]);
+			for (int s = 0; s < 2; ++s) {
+				__m512 co = _mm512_load_ps(matrix + j * static_cast<ptrdiff_t>(matrix_rows) + i + s * 16);
+				for (int p = 0; p < 8; ++p) a[s][p] = _mm512_fmadd_ps(co, x[p], a[s][p]);
+			}
+		}
+		for (int s = 0; s < 2; ++s) {
+			__m512 bias_ps = _mm512_load_ps(bias + i + s * 16);
+			ptrdiff_t idx = i + s * 16;
+			float *dst = idx >= static_cast<ptrdiff_t>(nns) ? ae + (idx - nns) : as + idx;
+			for (int p = 0; p < 8; ++p)
+				_mm512_store_ps(dst + static_cast<ptrdiff_t>(p) * nns, _mm512_fmadd_ps(_mm512_set1_ps(scale[p]), a[s][p], bias_ps));
+		}
+	}
+}
 
-template <unsigned N>
 class PredictorAVX512F final : public Predictor {
 	InterleavedPredictorModel m_model;
 	double m_inv_filter_size;
 	bool m_use_q2;
+	// (matvec row-block Step is fixed at 32 inside sgemv_x8_avx512; works for every nns.)
 
+	// mstd holds two 4-pixel blocks: mstd[0..15] for pixels 0-3, mstd[16..31] for pixels 4-7.
 	void apply_model(const float *input, float *activation, float *mstd, const __m512d *partial_sum_sumsq) const
 	{
 		unsigned filter_size = m_model.xdim * m_model.ydim;
 		unsigned nns = m_model.nns;
 
-		float *activation_softmax = activation;
-		float *activation_elliott = activation + 4 * nns;
+		float *as = activation, *ae = activation + 8 * nns;
 
 		input_stddev_x4(partial_sum_sumsq, mstd, m_inv_filter_size);
+		input_stddev_x4(partial_sum_sumsq + 8, mstd + 16, m_inv_filter_size);
+
+		alignas(64) float scale[8];   // per-pixel inv_std, gathered from both mstd blocks (non-contiguous)
+		for (int p = 0; p < 4; ++p) { scale[p] = mstd[8 + p]; scale[4 + p] = mstd[16 + 8 + p]; }
 
 		for (unsigned q = 0; q < (m_use_q2 ? 2U : 1U); ++q) {
 			const float *neurons = q ? m_model.neurons_q2 : m_model.neurons_q1;
 			const float *bias = q ? m_model.bias_q2 : m_model.bias_q1;
 
-			sgemv_x4_avx512<N>(neurons, input, bias, nns * 2, filter_size, activation, nns, mstd + 2 * 4);
-			softmax_exp(activation_softmax, 4 * nns);
-			wae5_x4(activation_softmax, activation_elliott, nns, mstd);
+			sgemv_x8_avx512(neurons, input, bias, nns * 2, filter_size, activation, nns, scale);
+			softmax_exp(as, 8 * nns);
+			wae5_x4(as, ae, nns, mstd);
+			wae5_x4(as + 4 * nns, ae + 4 * nns, nns, mstd + 16);
 		}
 	}
 public:
@@ -1036,9 +1068,9 @@ public:
 	{
 		FakeAllocator alloc;
 
-		alloc.allocate_n<float>(48 * 6 * 4);
-		alloc.allocate_n<float>(256 * 2 * 4);
-		alloc.allocate_n<float>(4 * 4);
+		alloc.allocate_n<float>(48 * 6 * 8);
+		alloc.allocate_n<float>(256 * 2 * 8);
+		alloc.allocate_n<float>(8 * 4);
 
 		return alloc.count();
 	}
@@ -1051,12 +1083,12 @@ public:
 		ptrdiff_t window_offset_x = static_cast<size_t>(m_model.xdim) / 2 - 1;
 		size_t filter_size = static_cast<size_t>(m_model.xdim) * m_model.ydim;
 
-		float *input = alloc.allocate_n<float>(48 * 6 * 4);
-		float *activation = alloc.allocate_n<float>(256 * 2 * 4);
-		float *mstd = alloc.allocate_n<float>(4 * 4);
+		float *input = alloc.allocate_n<float>(48 * 6 * 8);
+		float *activation = alloc.allocate_n<float>(256 * 2 * 8);
+		float *mstd = alloc.allocate_n<float>(8 * 4);
 
-		__m512d partial_sum_sumsq[8];
-		unsigned gathered_idx[4];
+		__m512d partial_sum_sumsq[16];
+		unsigned gathered_idx[8];
 		size_t num_gathered = 0;
 
 		for (ptrdiff_t i = 0; i < static_cast<ptrdiff_t>(n); ++i) {
@@ -1067,12 +1099,11 @@ public:
 			gathered_idx[num_gathered] = static_cast<unsigned>(i);
 			++num_gathered;
 
-			if (num_gathered == 4) {
+			if (num_gathered == 8) {
 				apply_model(input, activation, mstd, partial_sum_sumsq);
 
-				for (ptrdiff_t idx = 0; idx < 4; ++idx) {
-					dst[gathered_idx[idx]] = mstd[3 * 4 + idx] * (m_use_q2 ? 0.5f : 1.0f);
-				}
+				for (ptrdiff_t idx = 0; idx < 8; ++idx)
+					dst[gathered_idx[idx]] = mstd[(idx < 4 ? 0 : 16) + 3 * 4 + (idx & 3)] * (m_use_q2 ? 0.5f : 1.0f);
 
 				num_gathered = 0;
 			}
@@ -1080,9 +1111,8 @@ public:
 		if (num_gathered) {
 			apply_model(input, activation, mstd, partial_sum_sumsq);
 
-			for (ptrdiff_t idx = 0; idx < static_cast<ptrdiff_t>(num_gathered); ++idx) {
-				dst[gathered_idx[idx]] = mstd[3 * 4 + idx] * (m_use_q2 ? 0.5f : 1.0f);
-			}
+			for (ptrdiff_t idx = 0; idx < static_cast<ptrdiff_t>(num_gathered); ++idx)
+				dst[gathered_idx[idx]] = mstd[(idx < 4 ? 0 : 16) + 3 * 4 + (idx & 3)] * (m_use_q2 ? 0.5f : 1.0f);
 		}
 	}
 };
@@ -1159,25 +1189,28 @@ class PredictorInt16VNNIAVX512 final : public Predictor {
 		return 1.0f / SX;
 	}
 
-	// int16 mat-vec (vpdpwssd), 4 pixels: activation = (int32 dot) * invSW[row] * invSX[px] + bias
-	void sgemv(const uint32_t *M, const uint32_t *const V[4], const float *invSW, const float invSX[4], const float *bias, unsigned rows, unsigned P, float *result, unsigned nns) const
+	// int16 mat-vec (vpdpwssd), 8 pixels: activation = (int32 dot) * invSW[row] * invSX[px] + bias.
+	// 8 pixels/group (not 4) so the weight matrix -- streamed once per group from L2, the bandwidth
+	// bound for large windows -- is reused across twice as many pixels; ~1.25x on the 48x6 flagship.
+	// a[2][8] = 16 int32 accumulators; fits the 32-register file alongside the 8 broadcasts + weight.
+	void sgemv(const uint32_t *M, const uint32_t *const V[8], const float *invSW, const float invSX[8], const float *bias, unsigned rows, unsigned P, float *result, unsigned nns) const
 	{
-		float *as = result, *ae = result + 4 * static_cast<ptrdiff_t>(nns);
+		float *as = result, *ae = result + 8 * static_cast<ptrdiff_t>(nns);
 		for (unsigned i = 0; i < rows; i += 32) {
-			__m512i a[2][4];
-			for (int s = 0; s < 2; ++s) for (int p = 0; p < 4; ++p) a[s][p] = _mm512_setzero_si512();
+			__m512i a[2][8];
+			for (int s = 0; s < 2; ++s) for (int p = 0; p < 8; ++p) a[s][p] = _mm512_setzero_si512();
 			for (unsigned pr = 0; pr < P; ++pr) {
-				__m512i vp[4];
-				for (int p = 0; p < 4; ++p) vp[p] = _mm512_set1_epi32(static_cast<int>(V[p][pr]));
+				__m512i vp[8];
+				for (int p = 0; p < 8; ++p) vp[p] = _mm512_set1_epi32(static_cast<int>(V[p][pr]));
 				for (int s = 0; s < 2; ++s) {
 					__m512i w = _mm512_loadu_si512(reinterpret_cast<const void *>(M + static_cast<size_t>(pr) * rows + i + s * 16));
-					for (int p = 0; p < 4; ++p) a[s][p] = _mm512_dpwssds_epi32(a[s][p], w, vp[p]);   // saturating: see caps note
+					for (int p = 0; p < 8; ++p) a[s][p] = _mm512_dpwssds_epi32(a[s][p], w, vp[p]);   // saturating: see caps note
 				}
 			}
 			for (int s = 0; s < 2; ++s) {
 				__m512 isw = _mm512_load_ps(invSW + i + s * 16);
 				__m512 bs = _mm512_load_ps(bias + i + s * 16);
-				for (int p = 0; p < 4; ++p) {
+				for (int p = 0; p < 8; ++p) {
 					__m512 t = _mm512_mul_ps(_mm512_cvtepi32_ps(a[s][p]), isw);
 					__m512 v = _mm512_fmadd_ps(t, _mm512_set1_ps(invSX[p]), bs);
 					unsigned idx = i + s * 16;
@@ -1188,23 +1221,28 @@ class PredictorInt16VNNIAVX512 final : public Predictor {
 		}
 	}
 
+	// mstd holds two 4-pixel blocks: mstd[0..15] for pixels 0-3, mstd[16..31] for pixels 4-7.
 	void apply_model(const float *input, float *activation, float *mstd, const __m512d *partial_sum_sumsq) const
 	{
 		unsigned fs = m_model.xdim * m_model.ydim, nns = m_model.nns, P = fs / 2, rows = 2 * nns;
-		float *activation_softmax = activation, *activation_elliott = activation + 4 * nns;
+		float *as = activation, *ae = activation + 8 * nns;
 		input_stddev_x4(partial_sum_sumsq, mstd, m_inv_filter_size);
+		input_stddev_x4(partial_sum_sumsq + 8, mstd + 16, m_inv_filter_size);
 
-		alignas(64) uint32_t qwin[4 * (48 * 6 / 2)];
-		float invSX[4];
-		for (int p = 0; p < 4; ++p)
-			invSX[p] = quantize_window(input + static_cast<size_t>(p) * fs, mstd[p], mstd[8 + p], qwin + static_cast<size_t>(p) * P, fs);
-		const uint32_t *V[4] = { qwin, qwin + P, qwin + 2 * P, qwin + 3 * P };
+		alignas(64) uint32_t qwin[8 * (48 * 6 / 2)];
+		float invSX[8];
+		for (int p = 0; p < 8; ++p) {
+			const float *mp = (p < 4) ? mstd : mstd + 16;
+			invSX[p] = quantize_window(input + static_cast<size_t>(p) * fs, mp[p & 3], mp[8 + (p & 3)], qwin + static_cast<size_t>(p) * P, fs);
+		}
+		const uint32_t *V[8] = { qwin, qwin + P, qwin + 2 * P, qwin + 3 * P, qwin + 4 * P, qwin + 5 * P, qwin + 6 * P, qwin + 7 * P };
 
 		for (unsigned q = 0; q < (m_use_q2 ? 2U : 1U); ++q) {
 			sgemv(q ? m_qn_q2.data() : m_qn_q1.data(), V, q ? m_invSW_q2.data() : m_invSW_q1.data(),
 			      invSX, q ? m_model.bias_q2 : m_model.bias_q1, rows, P, activation, nns);
-			softmax_exp(activation_softmax, 4 * nns);
-			wae5_x4(activation_softmax, activation_elliott, nns, mstd);
+			softmax_exp(as, 8 * nns);
+			wae5_x4(as, ae, nns, mstd);
+			wae5_x4(as + 4 * nns, ae + 4 * nns, nns, mstd + 16);
 		}
 	}
 public:
@@ -1223,9 +1261,9 @@ public:
 	size_t get_tmp_size() const noexcept override
 	{
 		FakeAllocator alloc;
-		alloc.allocate_n<float>(48 * 6 * 4);
-		alloc.allocate_n<float>(256 * 2 * 4);
-		alloc.allocate_n<float>(4 * 4);
+		alloc.allocate_n<float>(48 * 6 * 8);
+		alloc.allocate_n<float>(256 * 2 * 8);
+		alloc.allocate_n<float>(8 * 4);
 		return alloc.count();
 	}
 
@@ -1237,12 +1275,12 @@ public:
 		ptrdiff_t window_offset_x = static_cast<size_t>(m_model.xdim) / 2 - 1;
 		size_t filter_size = static_cast<size_t>(m_model.xdim) * m_model.ydim;
 
-		float *input = alloc.allocate_n<float>(48 * 6 * 4);
-		float *activation = alloc.allocate_n<float>(256 * 2 * 4);
-		float *mstd = alloc.allocate_n<float>(4 * 4);
+		float *input = alloc.allocate_n<float>(48 * 6 * 8);
+		float *activation = alloc.allocate_n<float>(256 * 2 * 8);
+		float *mstd = alloc.allocate_n<float>(8 * 4);
 
-		__m512d partial_sum_sumsq[8];
-		unsigned gathered_idx[4];
+		__m512d partial_sum_sumsq[16];
+		unsigned gathered_idx[8];
 		size_t num_gathered = 0;
 
 		for (ptrdiff_t i = 0; i < static_cast<ptrdiff_t>(n); ++i) {
@@ -1253,17 +1291,17 @@ public:
 			gathered_idx[num_gathered] = static_cast<unsigned>(i);
 			++num_gathered;
 
-			if (num_gathered == 4) {
+			if (num_gathered == 8) {
 				apply_model(input, activation, mstd, partial_sum_sumsq);
-				for (ptrdiff_t idx = 0; idx < 4; ++idx)
-					dst[gathered_idx[idx]] = mstd[3 * 4 + idx] * (m_use_q2 ? 0.5f : 1.0f);
+				for (ptrdiff_t idx = 0; idx < 8; ++idx)
+					dst[gathered_idx[idx]] = mstd[(idx < 4 ? 0 : 16) + 3 * 4 + (idx & 3)] * (m_use_q2 ? 0.5f : 1.0f);
 				num_gathered = 0;
 			}
 		}
 		if (num_gathered) {
 			apply_model(input, activation, mstd, partial_sum_sumsq);
 			for (ptrdiff_t idx = 0; idx < static_cast<ptrdiff_t>(num_gathered); ++idx)
-				dst[gathered_idx[idx]] = mstd[3 * 4 + idx] * (m_use_q2 ? 0.5f : 1.0f);
+				dst[gathered_idx[idx]] = mstd[(idx < 4 ? 0 : 16) + 3 * 4 + (idx & 3)] * (m_use_q2 ? 0.5f : 1.0f);
 		}
 	}
 };
@@ -1419,10 +1457,7 @@ std::unique_ptr<Prescreener> create_prescreener_new_avx512f(const PrescreenerNew
 
 std::unique_ptr<Predictor> create_predictor_avx512f(const PredictorModel &model, bool use_q2)
 {
-	if (model.first.nns >= 32)
-		return std::make_unique<PredictorAVX512F<64>>(model, use_q2);
-	else
-		return std::make_unique<PredictorAVX512F<32>>(model, use_q2);
+	return std::make_unique<PredictorAVX512F>(model, use_q2);
 }
 
 std::unique_ptr<Predictor> create_predictor_int16_avx512vnni(const PredictorModel &model, bool use_q2)

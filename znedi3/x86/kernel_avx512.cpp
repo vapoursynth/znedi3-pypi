@@ -656,12 +656,23 @@ public:
 };
 
 
-inline FORCE_INLINE void gather_pixels_avx512(const float * const *src, ptrdiff_t offset_x, ptrdiff_t xdim, ptrdiff_t ydim, float *buf, __m512d *partial_sum_sumsq)
+// MinMax additionally reports the raw window's min and max, which the int16
+// predictor uses to derive its per-window quantisation scale. Folding it in
+// here is nearly free -- this loop already loads every tap for sum/sumsq, so
+// the cost is two more vector ops per 8 taps -- and it saves quantize_window
+// an entire pass over the window. The fp32 predictor instantiates
+// MinMax=false and keeps its exact instruction count.
+template <bool MinMax>
+inline FORCE_INLINE void gather_pixels_avx512_impl(const float * const *src, ptrdiff_t offset_x, ptrdiff_t xdim, ptrdiff_t ydim, float *buf, __m512d *partial_sum_sumsq,
+                                                   float *min_out, float *max_out)
 {
 	__m512d sum0 = _mm512_setzero_pd();
 	__m512d sum1 = _mm512_setzero_pd();
 	__m512d sumsq0 = _mm512_setzero_pd();
 	__m512d sumsq1 = _mm512_setzero_pd();
+
+	__m256 vmin = _mm256_set1_ps(FLT_MAX);
+	__m256 vmax = _mm256_set1_ps(-FLT_MAX);
 
 	{
 		const float *srcp0 = src[0];
@@ -685,6 +696,11 @@ inline FORCE_INLINE void gather_pixels_avx512(const float * const *src, ptrdiff_
 
 				_mm256_store_ps(buf + 0 * xdim + j, val0);
 				_mm256_store_ps(buf + 1 * xdim + j, val1);
+
+				if constexpr (MinMax) {
+					vmin = _mm256_min_ps(vmin, _mm256_min_ps(val0, val1));
+					vmax = _mm256_max_ps(vmax, _mm256_max_ps(val0, val1));
+				}
 			}
 			{
 				__m256 val0 = _mm256_loadu_ps(srcp2 + offset_x + j);
@@ -701,6 +717,11 @@ inline FORCE_INLINE void gather_pixels_avx512(const float * const *src, ptrdiff_
 
 				_mm256_store_ps(buf + 2 * xdim + j, val0);
 				_mm256_store_ps(buf + 3 * xdim + j, val1);
+
+				if constexpr (MinMax) {
+					vmin = _mm256_min_ps(vmin, _mm256_min_ps(val0, val1));
+					vmax = _mm256_max_ps(vmax, _mm256_max_ps(val0, val1));
+				}
 			}
 		}
 		buf += 4 * xdim;
@@ -725,12 +746,40 @@ inline FORCE_INLINE void gather_pixels_avx512(const float * const *src, ptrdiff_
 
 			_mm256_store_ps(buf + 0 * xdim + j, val0);
 			_mm256_store_ps(buf + 1 * xdim + j, val1);
+
+			if constexpr (MinMax) {
+				vmin = _mm256_min_ps(vmin, _mm256_min_ps(val0, val1));
+				vmax = _mm256_max_ps(vmax, _mm256_max_ps(val0, val1));
+			}
 		}
 		buf += 2 * xdim;
 	}
 
 	partial_sum_sumsq[0] = _mm512_add_pd(sum0, sum1);
 	partial_sum_sumsq[1] = _mm512_add_pd(sumsq0, sumsq1);
+
+	if constexpr (MinMax) {
+		__m128 mn = _mm_min_ps(_mm256_castps256_ps128(vmin), _mm256_extractf128_ps(vmin, 1));
+		mn = _mm_min_ps(mn, _mm_movehl_ps(mn, mn));
+		mn = _mm_min_ss(mn, _mm_shuffle_ps(mn, mn, 1));
+		*min_out = _mm_cvtss_f32(mn);
+
+		__m128 mx = _mm_max_ps(_mm256_castps256_ps128(vmax), _mm256_extractf128_ps(vmax, 1));
+		mx = _mm_max_ps(mx, _mm_movehl_ps(mx, mx));
+		mx = _mm_max_ss(mx, _mm_shuffle_ps(mx, mx, 1));
+		*max_out = _mm_cvtss_f32(mx);
+	}
+}
+
+inline FORCE_INLINE void gather_pixels_avx512(const float * const *src, ptrdiff_t offset_x, ptrdiff_t xdim, ptrdiff_t ydim, float *buf, __m512d *partial_sum_sumsq)
+{
+	gather_pixels_avx512_impl<false>(src, offset_x, xdim, ydim, buf, partial_sum_sumsq, nullptr, nullptr);
+}
+
+inline FORCE_INLINE void gather_pixels_minmax_avx512(const float * const *src, ptrdiff_t offset_x, ptrdiff_t xdim, ptrdiff_t ydim, float *buf, __m512d *partial_sum_sumsq,
+                                                     float *min_out, float *max_out)
+{
+	gather_pixels_avx512_impl<true>(src, offset_x, xdim, ydim, buf, partial_sum_sumsq, min_out, max_out);
 }
 
 inline FORCE_INLINE void input_stddev_x4(const __m512d *partial_sum_sumsq, float *mstd, double inv_size)
@@ -1172,17 +1221,23 @@ class PredictorInt16VNNIAVX512 final : public Predictor {
 	}
 
 	// normalise (x-mean)*inv_std, dynamic-scale so max|.| maps to xcap, saturate to int16 pairs. returns 1/scale.
-	static float quantize_window(const float *w, float mean, float inv, uint32_t *out, unsigned fs, float xcap)
+	//
+	// wmin/wmax are the raw window's bounds, accumulated during the gather (gather_pixels_minmax_avx512).
+	// Deriving max|(x-mean)*inv| from them is BIT-EXACT, not an approximation, so this replaces the scan
+	// over the normalised window with two scalar subs:
+	//   - fl(x - mean) is monotone non-decreasing in x for fixed mean, so the extreme deviations occur at
+	//     the extreme raw taps: max_k |fl(x_k - mean)| == max(fl(wmax - mean), fl(mean - wmin)).
+	//   - multiplication by inv >= 0 is monotone, so the max of the scaled deviations is the scaled max.
+	//     inv is never negative and never Inf (input_stddev_x4 forces 0 for a degenerate window).
+	// The 1e-9 floor stays *after* the scaling, exactly as before; it also absorbs the one case where the
+	// deviation can come out slightly negative -- a flat window whose rounded mean lands just outside
+	// [wmin, wmax], which necessarily has inv == 0.
+	static float quantize_window(const float *w, float mean, float inv, float wmin, float wmax, uint32_t *out, unsigned fs, float xcap)
 	{
-		const __m512i absmask = _mm512_set1_epi32(0x7FFFFFFF);
-		__m512 vm = _mm512_set1_ps(mean), vi = _mm512_set1_ps(inv), vmax = _mm512_setzero_ps();
-		for (unsigned j = 0; j < fs; j += 16) {
-			__m512 xn = _mm512_mul_ps(_mm512_sub_ps(_mm512_loadu_ps(w + j), vm), vi);
-			vmax = _mm512_max_ps(vmax, _mm512_castsi512_ps(_mm512_and_si512(_mm512_castps_si512(xn), absmask)));
-		}
-		float mx = _mm512_reduce_max_ps(vmax);
+		float mx = std::max(wmax - mean, mean - wmin) * inv;
 		if (mx < 1e-9f) mx = 1e-9f;
 		float SX = xcap / mx;
+		__m512 vm = _mm512_set1_ps(mean);
 		__m512 vs = _mm512_set1_ps(inv * SX);
 		for (unsigned j = 0; j < fs; j += 16) {
 			__m512 xn = _mm512_mul_ps(_mm512_sub_ps(_mm512_loadu_ps(w + j), vm), vs);
@@ -1224,7 +1279,8 @@ class PredictorInt16VNNIAVX512 final : public Predictor {
 	}
 
 	// mstd holds two 4-pixel blocks: mstd[0..15] for pixels 0-3, mstd[16..31] for pixels 4-7.
-	void apply_model(const float *input, float *activation, float *mstd, const __m512d *partial_sum_sumsq) const
+	void apply_model(const float *input, float *activation, float *mstd, const __m512d *partial_sum_sumsq,
+	                 const float *win_min, const float *win_max) const
 	{
 		unsigned fs = m_model.xdim * m_model.ydim, nns = m_model.nns, P = fs / 2, rows = 2 * nns;
 		float *as = activation, *ae = activation + 8 * nns;
@@ -1235,7 +1291,8 @@ class PredictorInt16VNNIAVX512 final : public Predictor {
 		float invSX[8];
 		for (int p = 0; p < 8; ++p) {
 			const float *mp = (p < 4) ? mstd : mstd + 16;
-			invSX[p] = quantize_window(input + static_cast<size_t>(p) * fs, mp[p & 3], mp[8 + (p & 3)], qwin + static_cast<size_t>(p) * P, fs, m_xcap);
+			invSX[p] = quantize_window(input + static_cast<size_t>(p) * fs, mp[p & 3], mp[8 + (p & 3)], win_min[p], win_max[p],
+			                           qwin + static_cast<size_t>(p) * P, fs, m_xcap);
 		}
 		const uint32_t *V[8] = { qwin, qwin + P, qwin + 2 * P, qwin + 3 * P, qwin + 4 * P, qwin + 5 * P, qwin + 6 * P, qwin + 7 * P };
 
@@ -1284,6 +1341,8 @@ public:
 		float *mstd = alloc.allocate_n<float>(8 * 4);
 
 		__m512d partial_sum_sumsq[16];
+		float win_min[8] = {};
+		float win_max[8] = {};
 		unsigned gathered_idx[8];
 		size_t num_gathered = 0;
 
@@ -1291,19 +1350,20 @@ public:
 			if (prescreen[i])
 				continue;
 
-			gather_pixels_avx512(src + window_offset_y, i - window_offset_x, m_model.xdim, m_model.ydim, input + num_gathered * filter_size, partial_sum_sumsq + num_gathered * 2);
+			gather_pixels_minmax_avx512(src + window_offset_y, i - window_offset_x, m_model.xdim, m_model.ydim, input + num_gathered * filter_size, partial_sum_sumsq + num_gathered * 2,
+			                            &win_min[num_gathered], &win_max[num_gathered]);
 			gathered_idx[num_gathered] = static_cast<unsigned>(i);
 			++num_gathered;
 
 			if (num_gathered == 8) {
-				apply_model(input, activation, mstd, partial_sum_sumsq);
+				apply_model(input, activation, mstd, partial_sum_sumsq, win_min, win_max);
 				for (ptrdiff_t idx = 0; idx < 8; ++idx)
 					dst[gathered_idx[idx]] = mstd[(idx < 4 ? 0 : 16) + 3 * 4 + (idx & 3)] * (m_use_q2 ? 0.5f : 1.0f);
 				num_gathered = 0;
 			}
 		}
 		if (num_gathered) {
-			apply_model(input, activation, mstd, partial_sum_sumsq);
+			apply_model(input, activation, mstd, partial_sum_sumsq, win_min, win_max);
 			for (ptrdiff_t idx = 0; idx < static_cast<ptrdiff_t>(num_gathered); ++idx)
 				dst[gathered_idx[idx]] = mstd[(idx < 4 ? 0 : 16) + 3 * 4 + (idx & 3)] * (m_use_q2 ? 0.5f : 1.0f);
 		}

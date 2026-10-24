@@ -34,7 +34,6 @@ znedi3_sources = [
 	'znedi3/x86/cpuinfo_x86.h',
 	'znedi3/znedi3.h',
 	'znedi3/znedi3_impl.h',
-	'znedi3/kernel.cpp',
 	'znedi3/weights.cpp',
 	'znedi3/x86/cpuinfo_x86.cpp',
 	'znedi3/x86/kernel_x86.cpp',
@@ -132,6 +131,17 @@ if host_machine.cpu_family() in ['x86', 'x86_64']
         include_directories: incdir,
         cpp_args: ['-mavx512f', '-mfma', '-mtune=skylake-avx512']
     )
+endif
+
+if host_machine.cpu_family() == 'aarch64'
+    # Allow reordering of the generic kernels' float sums so dot products
+    # vectorize with Neon. Remove once upstream has arm64 kernels in code.
+    libs += static_library('kernel_generic', 'znedi3/kernel.cpp',
+        include_directories: incdir,
+        cpp_args: cxx.get_supported_arguments('-fassociative-math', '-fno-signed-zeros', '-fno-trapping-math')
+    )
+else
+    sources += 'znedi3/kernel.cpp'
 endif
 
 py = import('python').find_installation(pure: false)
